@@ -180,17 +180,24 @@ class ResearchAnswer:
             raise SynthesisError(f"invalid stored answer JSON: {exc}") from exc
         if not isinstance(data, dict) or "session_id" not in data:
             raise SynthesisError("stored answer JSON is missing required fields")
-        return cls(
-            session_id=str(data["session_id"]),
-            question=str(data["question"]),
-            summary=str(data["summary"]),
-            statements=tuple(
-                Statement.from_dict(s) for s in (data.get("statements") or [])
-            ),
-            gaps=tuple(
-                ResearchGap.from_dict(g) for g in (data.get("gaps") or [])
-            ),
-        )
+        try:
+            return cls(
+                session_id=str(data["session_id"]),
+                question=str(data["question"]),
+                summary=str(data["summary"]),
+                statements=tuple(
+                    Statement.from_dict(s) for s in (data.get("statements") or [])
+                ),
+                gaps=tuple(
+                    ResearchGap.from_dict(g) for g in (data.get("gaps") or [])
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            # Missing / malformed fields must fail loudly and
+            # deterministically — never a silent partial answer.
+            raise SynthesisError(
+                f"stored answer JSON is missing or has invalid fields: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
