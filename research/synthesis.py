@@ -33,6 +33,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from hermes_cli.sqlite_util import write_txn
+
 from evidence import store as c1store
 from evidence import validation as c1validation
 
@@ -356,22 +358,25 @@ def synthesize(conn, session_id: str, *, force: bool = False) -> ResearchAnswer:
                     session_id)
         return answer  # no write, no event
 
-    store.set_final_answer(conn, session_id, answer_json)
-    store.add_event(
-        conn,
-        session_id=session_id,
-        event_type=EVENT_SYNTHESIZED,
-        detail=json.dumps(
-            {
-                "claim_count": len(answer.statements),
-                "citation_count": sum(
-                    len(s.citations) for s in answer.statements
-                ),
-                "gap_count": len(answer.gaps),
-            },
-            ensure_ascii=False,
-        ),
-    )
+    # final_answer + synthesized event commit atomically (P0-B): a crash
+    # cannot persist the answer without its audit event.
+    with write_txn(conn):
+        store.set_final_answer(conn, session_id, answer_json)
+        store.add_event(
+            conn,
+            session_id=session_id,
+            event_type=EVENT_SYNTHESIZED,
+            detail=json.dumps(
+                {
+                    "claim_count": len(answer.statements),
+                    "citation_count": sum(
+                        len(s.citations) for s in answer.statements
+                    ),
+                    "gap_count": len(answer.gaps),
+                },
+                ensure_ascii=False,
+            ),
+        )
     logger.info(
         "synthesized answer for session %s: %d statement(s), %d gap(s)",
         session_id, len(answer.statements), len(answer.gaps),

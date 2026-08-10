@@ -221,7 +221,11 @@ def list_sessions(conn: sqlite3.Connection) -> list[ResearchSession]:
 def update_session_status(
     conn: sqlite3.Connection, session_id: str, status: str
 ) -> bool:
-    """Set session status and bump ``updated_at``; returns whether it hit."""
+    """Set session status and bump ``updated_at``; returns whether it hit.
+
+    INTERNAL raw write — do NOT call outside the loop layer. Lifecycle
+    transitions belong to ``ResearchLoop.start/abort/_apply_stop``.
+    """
     cur = conn.execute(
         "UPDATE research_sessions SET status = ?, updated_at = CURRENT_TIMESTAMP "
         "WHERE id = ?",
@@ -376,7 +380,12 @@ def update_claim_status(
     status: str,
     notes: Optional[str] = None,
 ) -> bool:
-    """Raw status write (transition rules live in the claims layer)."""
+    """INTERNAL raw status write — do NOT call outside the claims layer.
+
+    Bypasses the claim transition matrix; callers MUST go through
+    ``claims.transition_claim`` / ``claims.evaluate_claim`` (domain rules
+    live there, including the atomic audit event).
+    """
     cur = conn.execute(
         "UPDATE claims SET status = ?, notes = COALESCE(?, notes), "
         "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -395,11 +404,16 @@ def link_evidence(
     claim_id: str,
     evidence_id: str,
     role: str,
+    event: Optional[tuple[str, str, Optional[str]]] = None,
 ) -> ClaimEvidenceLink:
     """Link evidence to a claim (idempotent on the 3-column PK).
 
     Raises sqlite3.IntegrityError for unknown claim/evidence or invalid
     role — FK/CHECK violations are never silently ignored.
+
+    ``event`` optionally carries ``(session_id, event_type, detail)`` for
+    an audit event inserted INSIDE the same transaction, so the link and
+    its audit event commit atomically (no nested write_txn).
     """
     with write_txn(conn):
         existing = conn.execute(
@@ -414,6 +428,13 @@ def link_evidence(
             "VALUES (?, ?, ?)",
             (claim_id, evidence_id, role),
         )
+        if event is not None:
+            session_id, event_type, detail = event
+            conn.execute(
+                "INSERT INTO research_events (session_id, event_type, detail) "
+                "VALUES (?, ?, ?)",
+                (session_id, event_type, detail),
+            )
     row = conn.execute(
         "SELECT * FROM claim_evidence WHERE claim_id = ? AND evidence_id = ? "
         "AND role = ?",

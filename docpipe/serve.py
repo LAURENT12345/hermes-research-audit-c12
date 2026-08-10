@@ -42,12 +42,16 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # pragma: no cover - logging must never block serving
         logging.basicConfig(level=logging.INFO)
 
-    # C1 (evidence) ships with the repo; serve the combined C0+C1 app.
-    # Fallback keeps docpipe.serve usable if evidence is ever removed.
+    # C1 (evidence) and C2 (research) ship with the repo; serve the
+    # combined C0+C1+C2 app. Fallbacks keep serving usable if a layer is
+    # ever removed.
     try:
-        from evidence.api import create_app
-    except ImportError:  # pragma: no cover - evidence ships in-tree
-        from docpipe.api import create_app
+        from research.api import create_app
+    except ImportError:  # pragma: no cover - research ships in-tree
+        try:
+            from evidence.api import create_app
+        except ImportError:  # pragma: no cover - evidence ships in-tree
+            from docpipe.api import create_app
 
     app = create_app(db_path=Path(args.db_path) if args.db_path else None)
     logging.getLogger("docpipe").info(

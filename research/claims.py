@@ -41,6 +41,8 @@ import json
 import logging
 from typing import Optional
 
+from hermes_cli.sqlite_util import write_txn
+
 from research import store
 from research.model import Claim, ClaimEvidenceLink
 from research.reasoner import ClaimProposal
@@ -187,20 +189,23 @@ def transition_claim(
             f"transition {claim.status} -> {to_status} is not allowed "
             f"(allowed: {sorted(allowed)})"
         )
-    store.update_claim_status(conn, claim_id, to_status, notes=notes)
-    store.add_event(
-        conn,
-        session_id=claim.session_id,
-        event_type=EVENT_CLAIM_STATUS_CHANGED,
-        detail=json.dumps(
-            {
-                "claim_id": claim_id,
-                "from": claim.status,
-                "to": to_status,
-                "reason": reason or REASON_MANUAL,
-            }
-        ),
-    )
+    # Status + audit event commit atomically: a crash cannot leave a
+    # changed status without its event (or an event without the status).
+    with write_txn(conn):
+        store.update_claim_status(conn, claim_id, to_status, notes=notes)
+        store.add_event(
+            conn,
+            session_id=claim.session_id,
+            event_type=EVENT_CLAIM_STATUS_CHANGED,
+            detail=json.dumps(
+                {
+                    "claim_id": claim_id,
+                    "from": claim.status,
+                    "to": to_status,
+                    "reason": reason or REASON_MANUAL,
+                }
+            ),
+        )
     logger.info(
         "claim %s: %s -> %s (reason=%s)", claim_id, claim.status, to_status, reason
     )
@@ -248,15 +253,18 @@ def link_evidence(
         return existing[0]
 
     claim = store.get_claim(conn, claim_id)
+    # Link + audit event commit atomically inside store.link_evidence's
+    # transaction (the event is passed in — no nested write_txn).
     link = store.link_evidence(
-        conn, claim_id=claim_id, evidence_id=evidence_id, role=role
-    )
-    store.add_event(
         conn,
-        session_id=claim.session_id,
-        event_type=EVENT_EVIDENCE_LINKED,
-        detail=json.dumps(
-            {"claim_id": claim_id, "evidence_id": evidence_id, "role": role}
+        claim_id=claim_id,
+        evidence_id=evidence_id,
+        role=role,
+        event=(
+            claim.session_id,
+            EVENT_EVIDENCE_LINKED,
+            json.dumps({"claim_id": claim_id, "evidence_id": evidence_id,
+                        "role": role}),
         ),
     )
     logger.info("evidence linked: %s %s -> %s", evidence_id, role, claim_id)

@@ -44,6 +44,8 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
+from hermes_cli.sqlite_util import write_txn
+
 import docpipe.db as c0db
 import evidence.store as c1store
 
@@ -352,21 +354,26 @@ class ResearchLoop:
             try:
                 result = fn()
             except Exception as exc2:  # noqa: BLE001 - surfaced as LoopPhaseError
-                store.complete_iteration(
-                    conn, row.id, status="failed", notes=type(exc2).__name__
-                )
-                self._event(
-                    conn, session.session_id, "phase_failed",
-                    {"session_id": session.session_id, "iteration": iteration,
-                     "phase": phase, "error": type(exc2).__name__},
-                )
+                # Phase failure state + audit event commit atomically.
+                with write_txn(conn):
+                    store.complete_iteration(
+                        conn, row.id, status="failed", notes=type(exc2).__name__
+                    )
+                    self._event(
+                        conn, session.session_id, "phase_failed",
+                        {"session_id": session.session_id, "iteration": iteration,
+                         "phase": phase, "error": type(exc2).__name__},
+                    )
                 raise LoopPhaseError(phase=phase, error_type=type(exc2).__name__) from exc2
 
-        store.complete_iteration(conn, row.id, status="completed")
-        self._event(
-            conn, session.session_id, "phase_completed",
-            {"session_id": session.session_id, "iteration": iteration, "phase": phase},
-        )
+        # Completion state + audit event commit atomically: a crash cannot
+        # mark the phase completed without its phase_completed event.
+        with write_txn(conn):
+            store.complete_iteration(conn, row.id, status="completed")
+            self._event(
+                conn, session.session_id, "phase_completed",
+                {"session_id": session.session_id, "iteration": iteration, "phase": phase},
+            )
         return result
 
     def _current_iteration(self, conn, session_id: str) -> tuple[int, set[str]]:
