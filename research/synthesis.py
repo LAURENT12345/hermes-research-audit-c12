@@ -174,7 +174,12 @@ class ResearchAnswer:
 
     @classmethod
     def from_json(cls, raw: str) -> "ResearchAnswer":
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SynthesisError(f"invalid stored answer JSON: {exc}") from exc
+        if not isinstance(data, dict) or "session_id" not in data:
+            raise SynthesisError("stored answer JSON is missing required fields")
         return cls(
             session_id=str(data["session_id"]),
             question=str(data["question"]),
