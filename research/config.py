@@ -28,3 +28,8 @@ SEARCH_LIMIT_PER_QUERY = 10
 
 #: Hard cap on claim statement length (characters).
 MAX_STATEMENT_CHARS = 400
+
+#: Per-session execution lease TTL (seconds). A crashed caller's lease
+#: expires after this and the next caller may take over. Long enough that
+#: a single iterate/start call completes well within it.
+SESSION_LOCK_TTL_SECONDS = 300

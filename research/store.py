@@ -48,6 +48,57 @@ from research.model import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Schema version / migration foundation
+#
+# The shared SQLite file's ``PRAGMA user_version`` is the version anchor
+# for the research (C2) schema. Version 1 = the current research_* schema.
+# C0/C1 layers still use their own idempotent CREATE TABLE IF NOT EXISTS
+# (they cannot be modified); the research layer owns the version counter.
+#
+# Migrations are ordered dicts {version: SQL}; each is applied inside its
+# own write_txn together with the version bump, so a crash cannot leave a
+# half-applied migration. A database with a HIGHER version than this
+# build understands is rejected deterministically.
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(Exception):
+    """The database schema version is newer than this build supports."""
+
+
+def _exec_sql_statements(conn: sqlite3.Connection, sql: str) -> None:
+    """Execute a multi-statement SQL script statement-by-statement.
+
+    ``executescript`` would implicitly COMMIT an open transaction, which
+    would break the atomic migration + version bump; splitting on ``;``
+    keeps every statement inside the caller's write_txn.
+    """
+    for statement in sql.split(";"):
+        statement = statement.strip()
+        if statement:
+            conn.execute(statement)
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current > SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"database schema version {current} is newer than supported "
+            f"version {SCHEMA_VERSION}; upgrade Hermes first"
+        )
+    for version in range(current + 1, SCHEMA_VERSION + 1):
+        sql = _MIGRATIONS.get(version)
+        if sql is None:  # pragma: no cover - guarded by SCHEMA_VERSION
+            raise SchemaVersionError(f"no migration defined for version {version}")
+        with write_txn(conn):
+            _exec_sql_statements(conn, sql)
+            conn.execute(f"PRAGMA user_version = {version}")
+        logger.info("research schema migrated to version %d", version)
+
+
 RESEARCH_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS research_sessions (
     id TEXT PRIMARY KEY,
@@ -140,6 +191,13 @@ CREATE TABLE IF NOT EXISTS claim_contradictions (
     resolved_at DATETIME
 );
 
+CREATE TABLE IF NOT EXISTS research_session_locks (
+    session_id TEXT PRIMARY KEY REFERENCES research_sessions(id) ON DELETE CASCADE,
+    token TEXT NOT NULL,
+    acquired_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS research_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
@@ -151,8 +209,19 @@ CREATE TABLE IF NOT EXISTS research_events (
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
-    """Apply the research schema idempotently (runs on every connect)."""
-    conn.executescript(RESEARCH_SCHEMA_SQL)
+    """Apply the research schema idempotently, driving version migrations.
+
+    ``PRAGMA user_version`` anchors the schema version: 0/1 databases are
+    migrated to ``SCHEMA_VERSION`` (migration 1 is the current schema);
+    a newer version is rejected deterministically.
+    """
+    _apply_migrations(conn)
+
+
+#: Ordered migrations {version: SQL}; migration 1 is the current schema.
+_MIGRATIONS: dict[int, str] = {
+    1: RESEARCH_SCHEMA_SQL,
+}
 
 
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -559,6 +628,60 @@ def list_session_documents(
         (session_id,),
     ).fetchall()
     return [int(r["document_id"]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# research_session_locks — per-session execution lease
+# ---------------------------------------------------------------------------
+
+def _sqlite_now(conn: sqlite3.Connection) -> str:
+    return str(conn.execute("SELECT datetime('now')").fetchone()[0])
+
+
+def acquire_session_lock(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    token: str,
+    ttl_seconds: int = config.SESSION_LOCK_TTL_SECONDS,
+) -> bool:
+    """Try to take the per-session execution lease.
+
+    Returns True when ownership was acquired (fresh or after the previous
+    lease expired — expiry makes the lease crash-safe across processes).
+    Returns False when another live lease holds the session.
+
+    The compare-and-set happens inside ``BEGIN IMMEDIATE``, so concurrent
+    callers cannot both win.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT expires_at FROM research_session_locks "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is not None and row["expires_at"] > _sqlite_now(conn):
+            return False  # held by a live lease
+        conn.execute(
+            "INSERT INTO research_session_locks (session_id, token, expires_at) "
+            "VALUES (?, ?, datetime('now', ?)) "
+            "ON CONFLICT(session_id) DO UPDATE SET token = excluded.token, "
+            "expires_at = excluded.expires_at, acquired_at = CURRENT_TIMESTAMP",
+            (session_id, token, f"+{int(ttl_seconds)} seconds"),
+        )
+        return True
+
+
+def release_session_lock(
+    conn: sqlite3.Connection, *, session_id: str, token: str
+) -> bool:
+    """Release the lease; only the current token holder may release."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM research_session_locks WHERE session_id = ? AND token = ?",
+            (session_id, token),
+        )
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

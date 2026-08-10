@@ -38,6 +38,7 @@ from research.loop import (
     LoopError,
     NoDocumentsError,
     ResearchLoop,
+    SessionBusyError,
     SessionNotActiveError,
     SessionNotFoundError,
 )
@@ -222,6 +223,10 @@ def build_research_router(db_path: Path | str | None = None) -> APIRouter:
             return JSONResponse(
                 status_code=409, content={"error": "invalid session transition"}
             )
+        except SessionBusyError:
+            return JSONResponse(
+                status_code=409, content={"error": "session busy"}
+            )
         except NoDocumentsError:
             return JSONResponse(
                 status_code=422, content={"error": "session has no documents"}
@@ -249,6 +254,10 @@ def build_research_router(db_path: Path | str | None = None) -> APIRouter:
         except SessionNotActiveError:
             return JSONResponse(
                 status_code=409, content={"error": "session not active"}
+            )
+        except SessionBusyError:
+            return JSONResponse(
+                status_code=409, content={"error": "session busy"}
             )
         except LoopError:
             return JSONResponse(

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -91,6 +92,10 @@ class InvalidSessionTransitionError(LoopError):
 
 class SessionNotActiveError(LoopError):
     """The session must be 'active' for this operation."""
+
+
+class SessionBusyError(LoopError):
+    """Another caller holds the per-session execution lease."""
 
 
 class NoDocumentsError(LoopError):
@@ -145,36 +150,54 @@ class ResearchLoop:
 
         ``document_ids`` binds C0 documents to the session on first
         start; a session with no documents cannot search.
+
+        The whole logical run holds the per-session execution lease, so
+        concurrent callers on the same session get ``SessionBusyError``
+        instead of interleaving phases.
         """
         conn = self._connect()
+        token = secrets.token_hex(16)
         try:
             session = self._require_session(conn, session_id)
-            if session.status == "draft":
-                if document_ids:
-                    for doc_id in document_ids:
-                        if c0db.get_document(conn, int(doc_id)) is None:
-                            raise LoopError(f"document {doc_id} not found in C0")
-                        store.add_session_document(
-                            conn, session_id=session_id, document_id=int(doc_id)
+            if not store.acquire_session_lock(
+                conn, session_id=session_id, token=token
+            ):
+                raise SessionBusyError(
+                    f"session {session_id} is busy; another call is running"
+                )
+            try:
+                if session.status == "draft":
+                    if document_ids:
+                        for doc_id in document_ids:
+                            if c0db.get_document(conn, int(doc_id)) is None:
+                                raise LoopError(f"document {doc_id} not found in C0")
+                            store.add_session_document(
+                                conn, session_id=session_id, document_id=int(doc_id)
+                            )
+                    if not store.list_session_documents(conn, session_id):
+                        raise NoDocumentsError(
+                            f"session {session_id} has no documents; pass document_ids"
                         )
-                if not store.list_session_documents(conn, session_id):
-                    raise NoDocumentsError(
-                        f"session {session_id} has no documents; pass document_ids"
+                    # draft -> active + audit event commit atomically.
+                    with write_txn(conn):
+                        store.update_session_status(conn, session_id, "active")
+                        store.add_event(
+                            conn,
+                            session_id=session_id,
+                            event_type="session_created",
+                            detail=json.dumps({"session_id": session_id}),
+                        )
+                elif session.status == "active":
+                    pass  # resume
+                else:
+                    raise InvalidSessionTransitionError(
+                        f"cannot start session {session_id} in state {session.status}"
                     )
-                store.update_session_status(conn, session_id, "active")
-                store.add_event(
-                    conn,
-                    session_id=session_id,
-                    event_type="session_created",
-                    detail=json.dumps({"session_id": session_id}),
+                return self._run_iterations(conn, session_id, iterations)
+            finally:
+                store.release_session_lock(
+                    conn, session_id=session_id, token=token
                 )
-            elif session.status == "active":
-                pass  # resume
-            else:
-                raise InvalidSessionTransitionError(
-                    f"cannot start session {session_id} in state {session.status}"
-                )
-            return self._run_iterations(conn, session_id, iterations)
         finally:
             conn.close()
 
@@ -189,7 +212,14 @@ class ResearchLoop:
         return self._iterate(session_id, iterations)
 
     def abort(self, session_id: str) -> None:
-        """Abort an active session; state is preserved, no synthesis."""
+        """Abort an active session; state is preserved, no synthesis.
+
+        Abort is a poison pill: it does not take the execution lease, so
+        it can stop a session while another call is mid-run; the running
+        loop observes the terminal status and stops at the next
+        iteration boundary. The status change and its audit event commit
+        atomically; a second concurrent abort cannot duplicate the event.
+        """
         conn = self._connect()
         try:
             session = self._require_session(conn, session_id)
@@ -198,13 +228,15 @@ class ResearchLoop:
                     f"only active sessions can be aborted; session {session_id} "
                     f"is {session.status}"
                 )
-            store.update_session_status(conn, session_id, "aborted")
-            store.add_event(
-                conn,
-                session_id=session_id,
-                event_type="aborted",
-                detail=json.dumps({"session_id": session_id}),
-            )
+            with write_txn(conn):
+                changed = store.update_session_status(conn, session_id, "aborted")
+                if changed:
+                    store.add_event(
+                        conn,
+                        session_id=session_id,
+                        event_type="aborted",
+                        detail=json.dumps({"session_id": session_id}),
+                    )
             logger.info("research session aborted: %s", session_id)
         finally:
             conn.close()
@@ -215,6 +247,7 @@ class ResearchLoop:
 
     def _iterate(self, session_id: str, iterations: int) -> LoopResult:
         conn = self._connect()
+        token = secrets.token_hex(16)
         try:
             session = self._require_session(conn, session_id)
             if session.status != "active":
@@ -222,7 +255,18 @@ class ResearchLoop:
                     f"session {session_id} is {session.status}; "
                     "only active sessions iterate"
                 )
-            return self._run_iterations(conn, session_id, iterations)
+            if not store.acquire_session_lock(
+                conn, session_id=session_id, token=token
+            ):
+                raise SessionBusyError(
+                    f"session {session_id} is busy; another call is running"
+                )
+            try:
+                return self._run_iterations(conn, session_id, iterations)
+            finally:
+                store.release_session_lock(
+                    conn, session_id=session_id, token=token
+                )
         finally:
             conn.close()
 
@@ -250,12 +294,14 @@ class ResearchLoop:
                     {"session_id": session_id, "iteration": iteration,
                      "phase": exc.phase, "error": exc.error_type},
                 )
-                store.update_session_status(conn, session_id, "failed")
-                self._event(
-                    conn, session_id, "failed",
-                    {"session_id": session_id,
-                     "reason": f"phase failure in {exc.phase} ({exc.error_type})"},
-                )
+                # active -> failed + audit event commit atomically.
+                with write_txn(conn):
+                    store.update_session_status(conn, session_id, "failed")
+                    self._event(
+                        conn, session_id, "failed",
+                        {"session_id": session_id,
+                         "reason": f"phase failure in {exc.phase} ({exc.error_type})"},
+                    )
                 iterations_run += 1
                 stop_reason = f"phase_failure:{exc.phase}"
                 break
@@ -565,24 +611,30 @@ class ResearchLoop:
         return None
 
     def _apply_stop(self, conn, session, stop_reason: str) -> None:
+        # Authoritative status transition + audit events commit atomically:
+        # a crash cannot leave a terminal status without its events.
         if stop_reason == STOP_SYNTHESIS_READY:
-            store.update_session_status(conn, session.session_id, "complete")
-            self._event(
-                conn, session.session_id, "synthesizing_ready",
-                {"session_id": session.session_id},
-            )
-            self._event(
-                conn, session.session_id, "session_completed",
-                {"session_id": session.session_id, "status": "complete",
-                 "stop_reason": stop_reason},
-            )
+            with write_txn(conn):
+                store.update_session_status(conn, session.session_id, "complete")
+                self._event(
+                    conn, session.session_id, "synthesizing_ready",
+                    {"session_id": session.session_id},
+                )
+                self._event(
+                    conn, session.session_id, "session_completed",
+                    {"session_id": session.session_id, "status": "complete",
+                     "stop_reason": stop_reason},
+                )
         else:
-            store.update_session_status(conn, session.session_id, "complete_with_gaps")
-            self._event(
-                conn, session.session_id, "session_completed",
-                {"session_id": session.session_id,
-                 "status": "complete_with_gaps", "stop_reason": stop_reason},
-            )
+            with write_txn(conn):
+                store.update_session_status(
+                    conn, session.session_id, "complete_with_gaps"
+                )
+                self._event(
+                    conn, session.session_id, "session_completed",
+                    {"session_id": session.session_id,
+                     "status": "complete_with_gaps", "stop_reason": stop_reason},
+                )
         logger.info(
             "research session %s -> %s (stop=%s)",
             session.session_id, store.get_session(conn, session.session_id).status,

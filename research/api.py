@@ -32,7 +32,9 @@ from evidence.model import is_valid_evidence_id
 from research.claims import ClaimNotFoundError, EvidenceNotFoundError
 from research.loop import (
     InvalidSessionTransitionError,
+    LoopError,
     NoDocumentsError,
+    SessionBusyError,
     SessionNotActiveError,
     SessionNotFoundError,
 )
@@ -56,6 +58,7 @@ _ERROR_MAP: tuple[tuple[type[Exception], int, str], ...] = (
     (ClaimNotFoundError, 404, "claim not found"),
     (EvidenceNotFoundError, 404, "evidence not found"),
     (SessionNotActiveError, 409, "session not active"),
+    (SessionBusyError, 409, "session busy"),
     (InvalidSessionTransitionError, 409, "invalid session transition"),
     (SynthesisNotAllowedError, 409, "synthesis not allowed"),
     (NoDocumentsError, 422, "session has no documents"),
