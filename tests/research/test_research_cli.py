@@ -241,7 +241,26 @@ def test_json_error_output(env, capsys):
     )
     assert code == 1
     parsed = json.loads(capsys.readouterr().out)
-    assert "error" in parsed
+    assert parsed == {"error": "session S-999999 not found", "exit": 1}
+
+
+def test_internal_error_no_traceback(capsys):
+    """Unexpected handler exceptions -> exit 1, 'error: internal error', no traceback."""
+    def _boom(args):  # pragma: no cover - deliberately raises
+        raise RuntimeError("kaboom")
+
+    # Human mode: short message on stderr, exit 1, never a traceback.
+    code = cli.research_command(_args(handler=_boom))
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "internal error: kaboom" in captured.err
+    assert "Traceback" not in captured.out + captured.err
+
+    # JSON mode: stdout is still valid machine-readable JSON.
+    code = cli.research_command(_args(json=True, handler=_boom))
+    assert code == 1
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed == {"error": "internal error: kaboom", "exit": 1}
 
 
 def test_db_path_command(env, capsys, monkeypatch):

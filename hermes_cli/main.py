@@ -4270,7 +4270,10 @@ def cmd_research(args):
     """C2 research engine (sessions, loop, claims, answer)."""
     from research.cli import research_command
 
-    return research_command(args)
+    # The top-level dispatcher ignores handler return values; propagate
+    # the CLI exit code explicitly (docpipe has the same latent issue —
+    # deferred, out of scope).
+    sys.exit(research_command(args) or 0)
 
 
 def cmd_project(args):
