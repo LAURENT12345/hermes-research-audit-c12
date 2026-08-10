@@ -279,6 +279,36 @@ def test_link_errors(seeded):
         conn.close()
 
 
+def test_link_fk_guarded_by_domain_errors(seeded):
+    """FK/CHECK violations surface as typed domain errors, never as raw
+    sqlite3.IntegrityError; the DB-level FK still exists as the last
+    line of defense against raw store writes."""
+    db_path, session_id, ev1, _ = _c(seeded)
+    conn = store.connect(db_path)
+    try:
+        c = claims.create_claim(conn, session_id=session_id, statement="T")
+        # Evidence FK violation -> EvidenceNotFoundError, not IntegrityError.
+        with pytest.raises(claims.EvidenceNotFoundError):
+            claims.link_evidence(conn, claim_id=c.claim_id, evidence_id="E-999999")
+        # Claim FK violation -> ClaimNotFoundError, not IntegrityError.
+        with pytest.raises(claims.ClaimNotFoundError):
+            claims.link_evidence(conn, claim_id="C-999999", evidence_id=ev1)
+        # role CHECK violation -> InvalidRoleError, not IntegrityError.
+        with pytest.raises(claims.InvalidRoleError):
+            claims.link_evidence(conn, claim_id=c.claim_id, evidence_id=ev1,
+                                 role="ambiguous")
+        # The underlying FKs still reject raw store-level writes.
+        with pytest.raises(sqlite3.IntegrityError):
+            store.link_evidence(conn, claim_id=c.claim_id,
+                                evidence_id="E-999999", role="supporting")
+        with pytest.raises(sqlite3.IntegrityError):
+            store.link_evidence(conn, claim_id="C-999999",
+                                evidence_id=ev1, role="supporting")
+        assert store.get_links_for_claim(conn, c.claim_id) == []
+    finally:
+        conn.close()
+
+
 def test_link_does_not_change_status(seeded):
     db_path, session_id, ev1, _ = _c(seeded)
     conn = store.connect(db_path)
@@ -398,6 +428,35 @@ def test_evaluate_invalid_support_does_not_count(seeded):
         )
         # ev1 still valid -> supported (min_supporting=1)
         assert claims.evaluate_claim(conn, c.claim_id).status == "supported"
+    finally:
+        conn.close()
+
+
+def test_evaluate_invalid_support_not_counted_min_two(seeded):
+    """Invariant 3 (min_supporting=2): one valid + one invalid supporting
+    evidence leaves the claim insufficient — invalid evidence never
+    counts toward sufficiency."""
+    db_path, session_id, ev1, ev2 = _c(seeded)
+    conn = store.connect(db_path)
+    try:
+        s2 = store.create_session(conn, question="Q2", min_supporting=2)
+        c = claims.create_claim(conn, session_id=s2.session_id, statement="T")
+        claims.link_evidence(conn, claim_id=c.claim_id, evidence_id=ev1,
+                             role="supporting")
+        claims.link_evidence(conn, claim_id=c.claim_id, evidence_id=ev2,
+                             role="supporting")
+        # Tamper chunk 2's content -> ev2 becomes invalid.
+        conn.execute(
+            "UPDATE chunks SET content = 'TAMPERED' WHERE "
+            "id = (SELECT chunk_id FROM evidence WHERE id = ?)", (ev2,)
+        )
+        result = claims.evaluate_claim(conn, c.claim_id)
+        assert result.status == "insufficient"
+        event = [
+            e for e in store.list_events(conn, s2.session_id)
+            if e.event_type == "claim_status_changed"
+        ][-1]
+        assert json.loads(event.detail)["reason"] == "insufficient_evidence"
     finally:
         conn.close()
 

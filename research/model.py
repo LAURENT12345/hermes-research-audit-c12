@@ -252,6 +252,55 @@ class LoopIteration:
 
 
 @dataclass(frozen=True)
+class Contradiction:
+    """A detected contradiction between a claim and evidence (or another
+    claim), with its resolution state.
+
+    ``kind``: ``explicit`` (valid contradicting evidence link) or
+    ``structural`` (deterministic token-overlap heuristic — advisory).
+    ``status``: ``open`` | ``resolved`` | ``dismissed``.
+    ``detail`` / ``resolution`` are JSON text (metadata only).
+    """
+
+    id: int
+    session_id: str
+    claim_id: str
+    kind: str  # 'explicit' | 'structural'
+    status: str  # 'open' | 'resolved' | 'dismissed'
+    detail: Optional[str]
+    resolution: Optional[str]
+    created_at: Optional[str]
+    resolved_at: Optional[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "claim_id": self.claim_id,
+            "kind": self.kind,
+            "status": self.status,
+            "detail": self.detail,
+            "resolution": self.resolution,
+            "created_at": self.created_at,
+            "resolved_at": self.resolved_at,
+        }
+
+    @classmethod
+    def from_row(cls, row: Any) -> "Contradiction":
+        return cls(
+            id=int(row["id"]),
+            session_id=str(row["session_id"]),
+            claim_id=str(row["claim_id"]),
+            kind=str(row["kind"]),
+            status=str(row["status"]),
+            detail=row["detail"],
+            resolution=row["resolution"],
+            created_at=row["created_at"],
+            resolved_at=row["resolved_at"],
+        )
+
+
+@dataclass(frozen=True)
 class ResearchEvent:
     """One append-only audit event for a session."""
 

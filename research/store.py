@@ -36,6 +36,7 @@ from research import config
 from research.model import (
     Claim,
     ClaimEvidenceLink,
+    Contradiction,
     LoopIteration,
     ResearchEvent,
     ResearchQuery,
@@ -101,6 +102,18 @@ CREATE TABLE IF NOT EXISTS research_iterations (
     completed_at DATETIME,
     notes TEXT,
     UNIQUE (session_id, iteration, phase)
+);
+
+CREATE TABLE IF NOT EXISTS claim_contradictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+    claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    detail TEXT,
+    resolution TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    resolved_at DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS research_events (
@@ -448,6 +461,85 @@ def list_iterations(
         (session_id,),
     ).fetchall()
     return [LoopIteration.from_row(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# claim_contradictions
+# ---------------------------------------------------------------------------
+
+def create_contradiction(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    claim_id: str,
+    kind: str,
+    detail: Optional[str] = None,
+) -> Contradiction:
+    """Insert an open contradiction record; returns it."""
+    conn.execute(
+        "INSERT INTO claim_contradictions (session_id, claim_id, kind, status, detail) "
+        "VALUES (?, ?, ?, 'open', ?)",
+        (session_id, claim_id, kind, detail),
+    )
+    row = conn.execute(
+        "SELECT * FROM claim_contradictions WHERE id = last_insert_rowid()"
+    ).fetchone()
+    return Contradiction.from_row(row)
+
+
+def get_contradiction(
+    conn: sqlite3.Connection, contradiction_id: int
+) -> Optional[Contradiction]:
+    row = conn.execute(
+        "SELECT * FROM claim_contradictions WHERE id = ?", (contradiction_id,)
+    ).fetchone()
+    return Contradiction.from_row(row) if row is not None else None
+
+
+def list_contradictions(
+    conn: sqlite3.Connection,
+    session_id: str,
+    status: Optional[str] = None,
+) -> list[Contradiction]:
+    if status is None:
+        rows = conn.execute(
+            "SELECT * FROM claim_contradictions WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM claim_contradictions WHERE session_id = ? AND status = ? "
+            "ORDER BY id",
+            (session_id, status),
+        ).fetchall()
+    return [Contradiction.from_row(row) for row in rows]
+
+
+def find_open_contradiction(
+    conn: sqlite3.Connection, claim_id: str, kind: str
+) -> Optional[Contradiction]:
+    """The open record for (claim, kind), if any (idempotency anchor)."""
+    row = conn.execute(
+        "SELECT * FROM claim_contradictions WHERE claim_id = ? AND kind = ? "
+        "AND status = 'open' ORDER BY id LIMIT 1",
+        (claim_id, kind),
+    ).fetchone()
+    return Contradiction.from_row(row) if row is not None else None
+
+
+def close_contradiction(
+    conn: sqlite3.Connection,
+    contradiction_id: int,
+    status: str,
+    resolution: Optional[str] = None,
+) -> bool:
+    """Close a record ('resolved' | 'dismissed') with its resolution JSON."""
+    cur = conn.execute(
+        "UPDATE claim_contradictions SET status = ?, resolution = ?, "
+        "resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (status, resolution, contradiction_id),
+    )
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
