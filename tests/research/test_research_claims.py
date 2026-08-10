@@ -505,6 +505,45 @@ def test_evaluate_no_change_no_event(seeded):
         conn.close()
 
 
+def test_evaluate_terminal_claim_returns_unchanged(seeded):
+    """Terminal claims (withdrawn/invalidated) are final: evaluate_claim
+    must return them immediately WITHOUT attempting a transition (which
+    would raise ClaimTransitionError — the matrix has no exit edges) and
+    without emitting any event. Regression: the research loop and
+    synthesis_eligible_claims evaluate EVERY claim, so a terminal claim
+    crashing the evaluator would break synthesis."""
+    db_path, session_id, ev1, _ = _c(seeded)
+    conn = store.connect(db_path)
+    try:
+        for terminal in ("withdrawn", "invalidated"):
+            c = claims.create_claim(conn, session_id=session_id,
+                                    statement=f"Terminal claim {terminal}.")
+            claims.link_evidence(conn, claim_id=c.claim_id, evidence_id=ev1,
+                                 role="supporting")
+            # Terminal statuses are normally reached via contradiction
+            # resolution / invalidation; the raw store write is used here
+            # because the transition matrix has no exit edges into
+            # 'withdrawn' from 'proposed'.
+            store.update_claim_status(conn, c.claim_id, terminal,
+                                      notes="fixture")
+            status_events = [
+                e for e in store.list_events(conn, session_id)
+                if e.event_type == "claim_status_changed"
+            ]
+            before = len(status_events)
+            result = claims.evaluate_claim(conn, c.claim_id)
+            assert result.status == terminal
+            assert result.claim_id == c.claim_id
+            # No transition attempted -> no new status event.
+            status_events = [
+                e for e in store.list_events(conn, session_id)
+                if e.event_type == "claim_status_changed"
+            ]
+            assert len(status_events) == before
+    finally:
+        conn.close()
+
+
 def test_evaluate_min_supporting_two(seeded):
     db_path, session_id, ev1, ev2 = _c(seeded)
     conn = store.connect(db_path)
