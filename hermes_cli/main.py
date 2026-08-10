@@ -4266,6 +4266,13 @@ def cmd_docpipe(args):
     return docpipe_command(args)
 
 
+def cmd_research(args):
+    """C2 research engine (sessions, loop, claims, answer)."""
+    from research.cli import research_command
+
+    return research_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -11938,7 +11945,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
-        "docpipe",
+        "docpipe", "research",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -12693,6 +12700,14 @@ def main():
 
     docpipe_parser = _build_docpipe_parser(subparsers)
     docpipe_parser.set_defaults(func=cmd_docpipe)
+
+    # =========================================================================
+    # research command — C2 research engine CLI
+    # =========================================================================
+    from research.cli import build_parser as _build_research_parser
+
+    research_parser = _build_research_parser(subparsers)
+    research_parser.set_defaults(func=cmd_research)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
