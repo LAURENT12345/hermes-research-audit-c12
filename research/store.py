@@ -104,6 +104,30 @@ CREATE TABLE IF NOT EXISTS research_iterations (
     UNIQUE (session_id, iteration, phase)
 );
 
+CREATE TABLE IF NOT EXISTS research_iteration_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    evidence_id TEXT NOT NULL REFERENCES evidence(id),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, iteration, evidence_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_iteration_state (
+    session_id TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+    iteration INTEGER NOT NULL,
+    known_evidence_ids TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, iteration)
+);
+
+CREATE TABLE IF NOT EXISTS research_session_documents (
+    session_id TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL REFERENCES documents(id),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, document_id)
+);
+
 CREATE TABLE IF NOT EXISTS claim_contradictions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
@@ -461,6 +485,118 @@ def list_iterations(
         (session_id,),
     ).fetchall()
     return [LoopIteration.from_row(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# research_session_documents
+# ---------------------------------------------------------------------------
+
+def add_session_document(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    document_id: int,
+) -> None:
+    """Bind a C0 document to a session (idempotent on the PK).
+
+    The document must exist — the FK raises on unknown ids (no
+    INSERT OR IGNORE, so integrity errors are never swallowed).
+    """
+    existing = conn.execute(
+        "SELECT 1 FROM research_session_documents "
+        "WHERE session_id = ? AND document_id = ?",
+        (session_id, document_id),
+    ).fetchone()
+    if existing is not None:
+        return
+    conn.execute(
+        "INSERT INTO research_session_documents (session_id, document_id) "
+        "VALUES (?, ?)",
+        (session_id, document_id),
+    )
+
+
+def list_session_documents(
+    conn: sqlite3.Connection, session_id: str
+) -> list[int]:
+    rows = conn.execute(
+        "SELECT document_id FROM research_session_documents "
+        "WHERE session_id = ? ORDER BY document_id",
+        (session_id,),
+    ).fetchall()
+    return [int(r["document_id"]) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# research_iteration_evidence / research_iteration_state
+# ---------------------------------------------------------------------------
+
+def add_iteration_evidence(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    iteration: int,
+    evidence_id: str,
+) -> None:
+    """Record an evidence id returned during an iteration (idempotent)."""
+    existing = conn.execute(
+        "SELECT 1 FROM research_iteration_evidence "
+        "WHERE session_id = ? AND iteration = ? AND evidence_id = ?",
+        (session_id, iteration, evidence_id),
+    ).fetchone()
+    if existing is not None:
+        return
+    conn.execute(
+        "INSERT INTO research_iteration_evidence (session_id, iteration, "
+        "evidence_id) VALUES (?, ?, ?)",
+        (session_id, iteration, evidence_id),
+    )
+
+
+def list_iteration_evidence(
+    conn: sqlite3.Connection, session_id: str, iteration: int
+) -> list[str]:
+    rows = conn.execute(
+        "SELECT evidence_id FROM research_iteration_evidence "
+        "WHERE session_id = ? AND iteration = ? ORDER BY evidence_id",
+        (session_id, iteration),
+    ).fetchall()
+    return [r["evidence_id"] for r in rows]
+
+
+def save_iteration_known(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    iteration: int,
+    known_evidence_ids: list[str],
+) -> None:
+    """Persist the session's known-evidence set at iteration start."""
+    import json as _json
+
+    conn.execute(
+        "INSERT INTO research_iteration_state (session_id, iteration, "
+        "known_evidence_ids) VALUES (?, ?, ?) "
+        "ON CONFLICT (session_id, iteration) DO UPDATE SET known_evidence_ids = "
+        "excluded.known_evidence_ids",
+        (session_id, iteration, _json.dumps(sorted(known_evidence_ids))),
+    )
+
+
+def load_iteration_known(
+    conn: sqlite3.Connection, session_id: str, iteration: int
+) -> set[str] | None:
+    """The persisted known-evidence set for an iteration, if recorded."""
+    import json as _json
+
+    row = conn.execute(
+        "SELECT known_evidence_ids FROM research_iteration_state "
+        "WHERE session_id = ? AND iteration = ?",
+        (session_id, iteration),
+    ).fetchone()
+    if row is None:
+        return None
+    return set(_json.loads(row["known_evidence_ids"]))
 
 
 # ---------------------------------------------------------------------------
