@@ -145,7 +145,14 @@ class ResearchQuery:
 
 @dataclass(frozen=True)
 class Claim:
-    """One atomic factual claim within a research session."""
+    """One atomic factual claim within a research session.
+
+    ``parent_claim_id`` (C3): set when this claim is an atomic
+    decomposition of another claim (NULL for top-level claims).
+    ``context`` (C3): optional JSON object of scope qualifiers
+    (population/dataset/task/...); NULL means "no context recorded" —
+    deliberately NOT interpreted as universal applicability.
+    """
 
     claim_id: str
     session_id: str
@@ -156,6 +163,8 @@ class Claim:
     notes: Optional[str]
     created_at: Optional[str]
     updated_at: Optional[str]
+    parent_claim_id: Optional[str] = None
+    context: Optional[str] = None  # JSON dict text
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -166,6 +175,8 @@ class Claim:
             "status": self.status,
             "confidence": self.confidence,
             "notes": self.notes,
+            "parent_claim_id": self.parent_claim_id,
+            "context": self.context,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -182,6 +193,8 @@ class Claim:
             notes=row["notes"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            parent_claim_id=row["parent_claim_id"],
+            context=row["context"],
         )
 
 

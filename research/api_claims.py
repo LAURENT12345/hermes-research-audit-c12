@@ -111,4 +111,58 @@ def build_claims_router(db_path: Path | str | None = None) -> APIRouter:
             return _db_error_response(exc)
         return {"claim_id": claim_id, "links": links}
 
+    @router.get("/research/claims/{claim_id}/coverage")
+    def get_claim_coverage_endpoint(claim_id: str) -> dict:
+        """Read-only: the DETERMINISTICALLY derived coverage observation
+        (never a research-gap claim)."""
+        if not is_valid_claim_id(claim_id):
+            return _error_response(400, "invalid claim ID")
+        try:
+            from research import verifier
+
+            conn = store.connect(db_path)
+            try:
+                if store.get_claim(conn, claim_id) is None:
+                    return _error_response(404, "claim not found")
+                observation = verifier.coverage_for_claim(conn, claim_id)
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            return _db_error_response(exc)
+        return {
+            "claim_id": observation.claim_id,
+            "coverage": observation.coverage,
+            "reasons": list(observation.reasons),
+        }
+
+    @router.get("/research/claims/{claim_id}/contradictions")
+    def get_claim_contradictions_endpoint(claim_id: str) -> dict:
+        """Read-only: open contradiction observations for a claim
+        (explicit/structural/semantic). Observations never change status."""
+        if not is_valid_claim_id(claim_id):
+            return _error_response(400, "invalid claim ID")
+        try:
+            conn = store.connect(db_path)
+            try:
+                if store.get_claim(conn, claim_id) is None:
+                    return _error_response(404, "claim not found")
+                records = [
+                    r for r in store.list_contradictions(
+                        conn, store.get_claim(conn, claim_id).session_id,
+                        status="open",
+                    )
+                    if r.claim_id == claim_id
+                ]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            return _db_error_response(exc)
+        return {
+            "claim_id": claim_id,
+            "observations": [
+                {"id": r.id, "kind": r.kind, "detail": r.detail}
+                for r in records
+            ],
+        }
+
     return router

@@ -138,6 +138,91 @@ evidence 41 tests pass).
 
 ## Next
 
-Commit 11 recommendation: C3 verification layer (claims ↔ evidence ↔
-citations, semantic contradiction via ReasonerPort) — now safe to build on
-the serialized, atomic, versioned foundation.
+Commit 12 recommendation: C4 external sources (web/Scholar) — the C3
+proposal layer is ready; C4 adds retriever adapters + `claim_evidence`
+context (migration 3). Or: extend C3 with a real reasoner adapter that
+generates decomposition/contradiction/context proposals.
+
+---
+
+# Commit 11 (C3) — Reasoner Verification Layer
+
+## What was added
+
+1. **ReasonerPort extension** (`research/reasoner.py`): five new
+   proposal-only methods (`propose_decomposition`,
+   `propose_evidence_relations`, `propose_semantic_contradictions`,
+   `propose_context`, `propose_coverage`) plus five immutable proposal
+   dataclasses (`ClaimDecompositionProposal`, `EvidenceRelationProposal`,
+   `SemanticContradictionProposal`, `ClaimContextProposal`,
+   `CoverageProposal`). `DeterministicReasoner` implements them with a
+   deterministic baseline (decomposition/semantic/context/coverage return
+   empty/None; evidence relations mirror the loop's supporting policy).
+
+2. **Deterministic verifier** (`research/verifier.py`): validates every
+   proposal against persisted objects before any write:
+   - decomposition: source claim exists; child evidence exists, valid,
+     and already linked to the source claim (fabricated IDs rejected);
+   - evidence relation: claim/evidence exist, evidence valid, role legal;
+   - semantic contradiction: both claims exist, evidence on each side
+     exists + valid + linked to the corresponding claim, rationale
+     non-empty, strength ∈ [0,1], context keys whitelisted;
+   - context: claim exists, keys ⊆ CONTEXT_KEYS, values str|None;
+   - coverage: label ∈ COVERAGE_LABELS and consistent with the derived
+     observation.
+   `apply_*` functions persist only validated proposals through the
+   domain layer (claims.create_claim / claims.link_evidence /
+   store.create_contradiction / store.set_claim_*). Never a direct raw
+   write.
+
+3. **Coverage (derived, deterministic)**: `coverage_for_claim` re-evaluates
+   the claim and derives exactly one of `directly_supported`,
+   `partially_supported`, `unsupported`, `contradictory`. The labels
+   `insufficient`/`irrelevant` are accepted proposal intents but never
+   derived — "no evidence found" is NEVER a research-gap claim.
+
+4. **Semantic contradiction = observation only**: persisted as
+   `claim_contradictions` rows with `kind='semantic'`; neither claim's
+   status changes; both findings remain in synthesis; multiple
+   observations are distinguishable and idempotent.
+
+5. **Schema migration 2** (via the Commit 10 mechanism): `claims` gains
+   `parent_claim_id` (decomposition provenance) and `context` (JSON).
+   Migration is an idempotent callable using the repo's
+   `add_column_if_missing`. SCHEMA_VERSION=2.
+
+6. **Minimal API/CLI**: read-only `GET /research/claims/{id}/coverage`
+   (derived observation) and `GET /research/claims/{id}/contradictions`
+   (open observations); CLI `hermes research coverage <claim_id>`. No
+   proposal-submission endpoints (proposals are a Python-level interface).
+
+## Tests
+
+29 new tests (`tests/research/test_research_verifier*.py`): proposal
+validation, decomposition provenance + unsupported-child exclusion,
+semantic contradiction (valid/wrong-side/fabricated/no-auto-invalidation/
+distinguishable), context (persistence/backward-compat/malformed),
+coverage (all four derivations + no research-gap conflation +
+contradicting-proposal rejection), synthesis safety (both sides
+traceable, citations resolve to persisted IDs), API/CLI inspection,
+migration v2 (fresh + v1→v2 upgrade preserving data + idempotent).
+
+Full regression: **475/475** (docpipe 70 + evidence 41 + research 364).
+Ruff: clean.
+
+## Files changed
+
+```
+M research/reasoner.py   C3 proposal types + ReasonerPort extension + baseline impl
+A research/verifier.py   deterministic validator + apply + coverage
+M research/model.py      Claim + parent_claim_id + context
+M research/store.py      migration 2 + set_claim_parent/context
+M research/api_claims.py coverage + contradictions endpoints (read-only)
+M research/cli.py        coverage command
+M research/README.md     C3 status
+M research/IMPLEMENTATION_REPORT.md  (this section)
+A tests/research/test_research_verifier.py    13 tests
+A tests/research/test_research_verifier2.py   16 tests
+M tests/research/test_research_model.py       Claim.to_dict keys
+M tests/research/test_research_hardening.py   v1 upgrade test (realistic v1 DB)
+```

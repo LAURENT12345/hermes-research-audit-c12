@@ -349,20 +349,27 @@ def test_reconnect_is_idempotent(env):
         conn.close()
 
 
-def test_upgrade_from_pre_version_database(env):
-    """A database created before versioning (user_version=0, tables already
-    present) is upgraded deterministically and keeps its data."""
-    db_path, session_id = env
+def test_upgrade_from_pre_version_database(tmp_path):
+    """A v1-era database (migration-1 schema, user_version=0/1) upgrades
+    to the current version deterministically and keeps its data."""
+    db_path = tmp_path / "v1.db"
     conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA user_version = 0")
+    conn.executescript(store._MIGRATIONS[1])  # v1 schema only (no v2 cols)
+    conn.execute("PRAGMA user_version = 0")   # pre-versioning marker
+    conn.execute(
+        "INSERT INTO research_sessions (id, question, status) "
+        "VALUES ('S-000001', 'old question', 'draft')"
+    )
     conn.commit()
     conn.close()
 
     conn = store.connect(db_path)
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
-        # Existing data survived the upgrade.
-        assert store.get_session(conn, session_id) is not None
+        # Existing data survived the upgrade; new columns are present.
+        assert store.get_session(conn, "S-000001") is not None
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(claims)")}
+        assert "parent_claim_id" in cols and "context" in cols
     finally:
         conn.close()
 

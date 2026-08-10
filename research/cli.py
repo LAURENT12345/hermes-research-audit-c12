@@ -317,6 +317,32 @@ def cmd_db_path(args) -> int:
     return 0
 
 
+def cmd_coverage(args) -> int:
+    """Read-only: the deterministically derived coverage of one claim."""
+    from research.verifier import coverage_for_claim
+
+    try:
+        conn = store.connect(_db_path_from_args(args))
+        try:
+            observation = coverage_for_claim(conn, args.claim_id)
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - domain/DB errors -> exit 1
+        return _error(args, str(exc))
+    payload = {
+        "claim_id": observation.claim_id,
+        "coverage": observation.coverage,
+        "reasons": list(observation.reasons),
+    }
+    if getattr(args, "json", False):
+        _emit(args, payload)
+    else:
+        print(f"{observation.claim_id}  coverage={observation.coverage}")
+        for reason in observation.reasons:
+            print(f"  {reason}")
+    return 0
+
+
 _HANDLERS = {
     "new": cmd_new,
     "list": cmd_list,
@@ -381,6 +407,12 @@ def add_research_subcommands(parser: argparse.ArgumentParser) -> None:
     sub.add_parser("db-path", help="Print the resolved SQLite path").set_defaults(
         handler=cmd_db_path
     )
+
+    p_coverage = sub.add_parser(
+        "coverage", help="Derived evidence coverage of a claim (read-only)"
+    )
+    p_coverage.add_argument("claim_id")
+    p_coverage.set_defaults(handler=cmd_coverage)
 
 
 def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:

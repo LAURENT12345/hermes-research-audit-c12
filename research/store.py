@@ -28,7 +28,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli.sqlite_util import write_txn
+from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 
 import evidence.store as c1store
 
@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # build understands is rejected deterministically.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(Exception):
@@ -82,6 +82,22 @@ def _exec_sql_statements(conn: sqlite3.Connection, sql: str) -> None:
             conn.execute(statement)
 
 
+def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+    """C3: claims gain decomposition provenance + scope context.
+
+    Uses the repo's idempotent ``add_column_if_missing`` so a database
+    that somehow already carries the columns (e.g. version reset on a
+    current DB) upgrades cleanly instead of failing on duplicate column.
+    """
+    add_column_if_missing(
+        conn, "claims", "parent_claim_id",
+        "parent_claim_id TEXT REFERENCES claims(id)",
+    )
+    add_column_if_missing(
+        conn, "claims", "context", "context TEXT"
+    )
+
+
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     current = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if current > SCHEMA_VERSION:
@@ -90,11 +106,14 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             f"version {SCHEMA_VERSION}; upgrade Hermes first"
         )
     for version in range(current + 1, SCHEMA_VERSION + 1):
-        sql = _MIGRATIONS.get(version)
-        if sql is None:  # pragma: no cover - guarded by SCHEMA_VERSION
+        migration = _MIGRATIONS.get(version)
+        if migration is None:  # pragma: no cover - guarded by SCHEMA_VERSION
             raise SchemaVersionError(f"no migration defined for version {version}")
         with write_txn(conn):
-            _exec_sql_statements(conn, sql)
+            if callable(migration):
+                migration(conn)
+            else:
+                _exec_sql_statements(conn, migration)
             conn.execute(f"PRAGMA user_version = {version}")
         logger.info("research schema migrated to version %d", version)
 
@@ -218,9 +237,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _apply_migrations(conn)
 
 
-#: Ordered migrations {version: SQL}; migration 1 is the current schema.
-_MIGRATIONS: dict[int, str] = {
+#: Ordered migrations {version: SQL or callable}; migration 1 is the
+#: current schema. Callables receive the connection and run inside the
+#: migration's write_txn (used for idempotent ALTERs).
+_MIGRATIONS: dict[int, object] = {
     1: RESEARCH_SCHEMA_SQL,
+    2: _migrate_to_v2,
 }
 
 
@@ -459,6 +481,27 @@ def update_claim_status(
         "UPDATE claims SET status = ?, notes = COALESCE(?, notes), "
         "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (status, notes, claim_id),
+    )
+    return cur.rowcount > 0
+
+
+def set_claim_parent(
+    conn: sqlite3.Connection, claim_id: str, parent_claim_id: Optional[str]
+) -> bool:
+    """Record decomposition provenance (C3): the claim's parent claim."""
+    cur = conn.execute(
+        "UPDATE claims SET parent_claim_id = ? WHERE id = ?",
+        (parent_claim_id, claim_id),
+    )
+    return cur.rowcount > 0
+
+
+def set_claim_context(
+    conn: sqlite3.Connection, claim_id: str, context_json: Optional[str]
+) -> bool:
+    """Store a claim's scope context as JSON text (C3); None clears it."""
+    cur = conn.execute(
+        "UPDATE claims SET context = ? WHERE id = ?", (context_json, claim_id)
     )
     return cur.rowcount > 0
 

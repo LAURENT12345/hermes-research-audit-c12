@@ -100,6 +100,96 @@ class SynthesisDraft:
     )  # each: {"claim_id", "statement", "evidence_ids"}
 
 
+# ---------------------------------------------------------------------------
+# C3 proposal types (reasoner PROPOSES; the deterministic verifier decides)
+# ---------------------------------------------------------------------------
+
+#: Allowed claim scope/context keys (extensible; do not build an ontology).
+CONTEXT_KEYS = (
+    "population", "dataset", "task", "intervention", "condition",
+    "method", "model", "setting",
+)
+
+COVERAGE_DIRECTLY_SUPPORTED = "directly_supported"
+COVERAGE_PARTIALLY_SUPPORTED = "partially_supported"
+COVERAGE_UNSUPPORTED = "unsupported"
+COVERAGE_CONTRADICTORY = "contradictory"
+COVERAGE_INSUFFICIENT = "insufficient"  # evidence exists but is insufficient
+COVERAGE_IRRELEVANT = "irrelevant"      # reserved for C4; never derived here
+
+COVERAGE_LABELS = frozenset({
+    COVERAGE_DIRECTLY_SUPPORTED, COVERAGE_PARTIALLY_SUPPORTED,
+    COVERAGE_UNSUPPORTED, COVERAGE_CONTRADICTORY,
+    COVERAGE_INSUFFICIENT, COVERAGE_IRRELEVANT,
+})
+
+
+@dataclass(frozen=True)
+class ClaimDecompositionProposal:
+    """Propose splitting a broad claim into atomic child propositions.
+
+    ``child_evidence_ids`` must reference evidence ALREADY linked to the
+    source claim (the verifier checks this); children inherit that
+    support. The reasoner may propose, the verifier + evaluator decide.
+    """
+
+    source_claim_id: str
+    child_statements: tuple[str, ...]
+    child_evidence_ids: tuple[str, ...]
+    rationale: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class EvidenceRelationProposal:
+    """Propose a claim <-> evidence relationship."""
+
+    claim_id: str
+    evidence_id: str
+    role: str  # 'supporting' | 'contradicting'
+
+
+@dataclass(frozen=True)
+class SemanticContradictionProposal:
+    """OBSERVE that two claims are semantically contradictory.
+
+    Observation only: the verifier records it without changing either
+    claim's authoritative status; both findings are preserved.
+    """
+
+    claim_a_id: str
+    claim_b_id: str
+    evidence_a_ids: tuple[str, ...]
+    evidence_b_ids: tuple[str, ...]
+    rationale: str
+    context: Optional[dict] = None
+    strength: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ClaimContextProposal:
+    """Propose scope/context qualifiers for a claim.
+
+    Missing values are recorded as explicit None — NEVER interpreted as
+    universal applicability."""
+
+    claim_id: str
+    context: dict  # keys subset of CONTEXT_KEYS; values str | None
+
+
+@dataclass(frozen=True)
+class CoverageProposal:
+    """Propose an evidence-coverage observation for a claim.
+
+    The deterministic verifier derives the authoritative coverage from
+    persisted state; a proposal that contradicts derived state is
+    rejected. ``irrelevant``/``insufficient`` are accepted labels for
+    future reasoners but are never derived as "research gap"."""
+
+    claim_id: str
+    coverage: str  # one of COVERAGE_LABELS
+    notes: Optional[str] = None
+
+
 @runtime_checkable
 class ReasonerPort(Protocol):
     """The reasoning capability C2 requires.
@@ -118,6 +208,29 @@ class ReasonerPort(Protocol):
 
     def synthesize(self, supported_claims: Sequence[SupportedClaim]) -> SynthesisDraft:
         """Draft the final synthesis from evaluator-approved claims."""
+
+    # -- C3 proposal generation (all pure; the verifier decides) ----------
+
+    def propose_decomposition(
+        self, claim: "Claim"
+    ) -> list[ClaimDecompositionProposal]:
+        """Propose atomic child claims for a broad claim."""
+
+    def propose_evidence_relations(
+        self, claim: "Claim", evidence: Sequence[Evidence]
+    ) -> list[EvidenceRelationProposal]:
+        """Propose claim <-> evidence relationships."""
+
+    def propose_semantic_contradictions(
+        self, claim_a: "Claim", claim_b: "Claim"
+    ) -> list[SemanticContradictionProposal]:
+        """Observe a semantic contradiction between two claims (if any)."""
+
+    def propose_context(self, claim: "Claim") -> Optional[ClaimContextProposal]:
+        """Propose scope/context qualifiers for a claim."""
+
+    def propose_coverage(self, claim: "Claim") -> Optional[CoverageProposal]:
+        """Propose an evidence-coverage observation for a claim."""
 
 
 class DeterministicReasoner:
@@ -211,3 +324,43 @@ class DeterministicReasoner:
             summary=f"Deterministic synthesis of {len(ordered)} supported claim(s)",
             statements=statements,
         )
+
+    # -- C3 proposals: deterministic baseline -------------------------------
+
+    def propose_decomposition(
+        self, claim: "Claim"
+    ) -> list[ClaimDecompositionProposal]:
+        """Baseline reasoner performs no semantic decomposition.
+
+        Rich decomposition arrives with a future reasoner adapter; the
+        verifier already supports the proposal type."""
+
+        return []
+
+    def propose_evidence_relations(
+        self, claim: "Claim", evidence: Sequence[Evidence]
+    ) -> list[EvidenceRelationProposal]:
+        """Baseline: every evidence promotes a supporting relationship —
+        the same deterministic policy the loop already applies."""
+        return [
+            EvidenceRelationProposal(
+                claim_id=claim.claim_id, evidence_id=e.evidence_id,
+                role="supporting",
+            )
+            for e in evidence
+        ]
+
+    def propose_semantic_contradictions(
+        self, claim_a: "Claim", claim_b: "Claim"
+    ) -> list[SemanticContradictionProposal]:
+        """Baseline reasoner has no semantic insight; returns none."""
+        return []
+
+    def propose_context(self, claim: "Claim") -> Optional[ClaimContextProposal]:
+        """Baseline reasoner proposes no context."""
+        return None
+
+    def propose_coverage(self, claim: "Claim") -> Optional[CoverageProposal]:
+        """Baseline reasoner proposes no coverage (the verifier derives it
+        deterministically from persisted state)."""
+        return None

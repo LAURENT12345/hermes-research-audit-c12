@@ -84,7 +84,8 @@ def test_claim_to_dict_shape():
     assert d["statement_normalized"] == "the dot product has variance d_k."
     assert set(d) == {
         "claim_id", "session_id", "statement", "statement_normalized",
-        "status", "confidence", "notes", "created_at", "updated_at",
+        "status", "confidence", "notes", "parent_claim_id", "context",
+        "created_at", "updated_at",
     }
 
 

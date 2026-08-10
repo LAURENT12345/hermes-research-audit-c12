@@ -179,8 +179,17 @@ lease and stops the loop at the next iteration boundary.
 
 ## Roadmap (C3/C4/C5 — NOT implemented)
 
-* **C3** — verification: claims ↔ evidence ↔ citations; semantic
+* **C3 — verification**: claims ↔ evidence ↔ citations; semantic
   contradiction adjudication (through the ReasonerPort).
+
+**C3 status (Commit 11):** the proposal infrastructure and deterministic
+verifier exist (`research/reasoner.py` C3 proposal types,
+`research/verifier.py`). A future reasoner adapter may propose claim
+decompositions, evidence relationships, semantic contradiction
+observations, scope/context, and coverage — every proposal is verified
+against persisted objects before anything is persisted. The baseline
+`DeterministicReasoner` performs no semantic work.
+
 * **C4** — external sources: web/Scholar; requires `claim_evidence`
   context + C1 `source_type` extension.
 * **C5** — full research agent.
