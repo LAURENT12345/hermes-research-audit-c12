@@ -39,9 +39,14 @@ def _emit(args, payload: Any) -> None:
 
 
 def _error(args, message: str, code: int = 1) -> int:
-    """Print an error (JSON when requested) and return the exit code."""
+    """Print an error (JSON when requested) and return the exit code.
+
+    Human mode writes ``error: <msg>`` to stderr; ``--json`` writes
+    ``{"error": "<msg>", "exit": <code>}`` to stdout — stdout stays
+    machine-readable JSON on every path.
+    """
     if getattr(args, "json", False):
-        print(json.dumps({"error": message}, ensure_ascii=False))
+        print(json.dumps({"error": message, "exit": code}, ensure_ascii=False))
     else:
         print(f"error: {message}", file=sys.stderr)
     return code
@@ -232,8 +237,8 @@ def cmd_claims(args) -> int:
         for claim in claims:
             notes = f"  notes={claim.get('notes')}" if claim.get("notes") else ""
             print(
-                f"{claim['claim_id']}  {claim['status']:12s}  "
-                f"{claim['statement'][:70]}{notes}"
+                f"{claim['claim_id']}  {claim['statement'][:70]}  "
+                f"{claim['status']}{notes}"
             )
     return 0
 
@@ -274,7 +279,10 @@ def cmd_synthesize(args) -> int:
     try:
         conn = store.connect(_db_path_from_args(args))
         try:
-            before = store.get_session(conn, args.session_id).final_answer
+            session = store.get_session(conn, args.session_id)
+            if session is None:
+                return _error(args, f"session {args.session_id} not found")
+            before = session.final_answer
             answer = synthesize(conn, args.session_id)
             after = store.get_session(conn, args.session_id).final_answer
         finally:
@@ -287,6 +295,7 @@ def cmd_synthesize(args) -> int:
         "claim_count": len(answer.statements),
         "citation_count": sum(len(s.citations) for s in answer.statements),
         "gap_count": len(answer.gaps),
+        "answer": answer.to_dict(),
     }
     if getattr(args, "json", False):
         _emit(args, payload)
@@ -398,9 +407,11 @@ def research_command(args) -> int:
     """Dispatch entry used by ``hermes_cli.main`` (docpipe-style)."""
     handler = getattr(args, "handler", None)
     if handler is None:
-        print("unknown research subcommand", file=sys.stderr)
-        return 2
-    return int(handler(args) or 0)
+        return _error(args, "unknown research subcommand", code=2)
+    try:
+        return int(handler(args) or 0)
+    except Exception as exc:  # noqa: BLE001 - internal errors: exit 1, no traceback
+        return _error(args, f"internal error: {exc}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
