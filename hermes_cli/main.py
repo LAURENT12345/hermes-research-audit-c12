@@ -4259,6 +4259,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_docpipe(args):
+    """C0 local document pipeline (PDF -> chunks -> SQLite + FTS5)."""
+    from docpipe.cli import docpipe_command
+
+    return docpipe_command(args)
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -11931,6 +11938,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "docpipe",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -12677,6 +12685,14 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # docpipe command — C0 local document pipeline (PDF -> chunks -> FTS5)
+    # =========================================================================
+    from docpipe.cli import build_parser as _build_docpipe_parser
+
+    docpipe_parser = _build_docpipe_parser(subparsers)
+    docpipe_parser.set_defaults(func=cmd_docpipe)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
