@@ -230,6 +230,19 @@ def update_session_status(
     return cur.rowcount > 0
 
 
+def set_final_answer(
+    conn: sqlite3.Connection, session_id: str, final_answer: str
+) -> bool:
+    """Persist the synthesized answer WITHOUT touching session status
+    (a complete_with_gaps session must stay complete_with_gaps)."""
+    cur = conn.execute(
+        "UPDATE research_sessions SET final_answer = ?, updated_at = "
+        "CURRENT_TIMESTAMP WHERE id = ?",
+        (final_answer, session_id),
+    )
+    return cur.rowcount > 0
+
+
 def set_session_answer(
     conn: sqlite3.Connection, session_id: str, final_answer: str
 ) -> bool:

@@ -278,6 +278,10 @@ def evaluate_claim(conn, claim_id: str) -> Claim:
     supported claim loses its support); when it matches, nothing changes.
     """
     claim = _require_claim(conn, claim_id)
+    if claim.status in ("withdrawn", "invalidated"):
+        # Terminal statuses are final by design: never re-evaluated (a
+        # transition out of them is not part of the state machine).
+        return claim
     session = store.get_session(conn, claim.session_id)
     if session is None:  # pragma: no cover - FK prevents this
         raise ClaimError(f"session {claim.session_id} missing for claim {claim_id}")
