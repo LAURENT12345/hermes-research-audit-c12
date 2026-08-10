@@ -184,6 +184,24 @@ def test_set_session_answer(seeded):
         conn.close()
 
 
+def test_set_final_answer_preserves_status(seeded):
+    """set_final_answer persists the payload WITHOUT touching session
+    status — a complete_with_gaps session must stay complete_with_gaps
+    (synthesis must never force 'complete')."""
+    db_path, *_ = seeded
+    conn = _connect(db_path)
+    try:
+        store.update_session_status(conn, "S-000001", "complete_with_gaps")
+        assert store.set_final_answer(conn, "S-000001", '{"statements": []}')
+        s = store.get_session(conn, "S-000001")
+        assert s.status == "complete_with_gaps"
+        assert s.final_answer == '{"statements": []}'
+        # Unknown session -> False, no row touched.
+        assert not store.set_final_answer(conn, "S-999999", "{}")
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Queries
 # ---------------------------------------------------------------------------
