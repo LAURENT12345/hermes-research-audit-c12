@@ -42,11 +42,16 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:  # pragma: no cover - logging must never block serving
         logging.basicConfig(level=logging.INFO)
 
-    from docpipe.api import create_app
+    # C1 (evidence) ships with the repo; serve the combined C0+C1 app.
+    # Fallback keeps docpipe.serve usable if evidence is ever removed.
+    try:
+        from evidence.api import create_app
+    except ImportError:  # pragma: no cover - evidence ships in-tree
+        from docpipe.api import create_app
 
     app = create_app(db_path=Path(args.db_path) if args.db_path else None)
     logging.getLogger("docpipe").info(
-        "C0 document pipeline API listening on http://%s:%d (docs at /docs)",
+        "C0+C1 pipelines API listening on http://%s:%d (docs at /docs)",
         args.host,
         args.port,
     )
