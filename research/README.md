@@ -15,12 +15,14 @@ PDF ──► C0 (docpipe) ──► chunks + FTS5 ──► C1 (evidence) ─�
 
 ```
 research/
-├── config.py         engineering defaults (chunk of limits, lease TTL)
+├── config.py         engineering defaults (chunk of limits, lease TTL, LLM defaults)
 ├── model.py           ResearchSession/ResearchQuery/Claim/ClaimEvidenceLink/
 │                      LoopIteration/Contradiction/ResearchEvent + ID helpers
 ├── store.py           research_* tables + lease + schema-version migrations
 ├── retriever.py       LocalRetriever: C0 search + C1 evidence (orchestration only)
 ├── reasoner.py        ReasonerPort (Protocol) + DeterministicReasoner (proposal-only)
+├── llm_reasoner.py    LLMReasoner (Commit 12): proposal-only LLM adapter for ReasonerPort
+├── llm_transport.py   smallest LLM transport boundary (OpenAI-compatible, env credentials)
 ├── claims.py          claim creation, transition matrix, linking, evaluator
 ├── sufficiency.py     claim/session sufficiency assessment (read-only)
 ├── contradictions.py  explicit/structural detection + resolution + synthesis guard
@@ -45,13 +47,21 @@ Every authoritative decision is made by deterministic code:
   every linked evidence via C1 (`evidence.validation.validate_evidence`)
   on each call; persisted statuses are never trusted.
 * **The reasoner only proposes** (`plan_queries`, `construct_claims`,
-  `adjudicate`, `synthesize`). It has no store access and cannot set
-  claim/session status (enforced by `tests/research/test_arch_boundary.py`).
+  `adjudicate`, `synthesize` — and the C3 `propose_*` methods on both
+  `DeterministicReasoner` and `LLMReasoner`). It has no store access and
+  cannot set claim/session status (enforced by
+  `tests/research/test_arch_boundary.py`, which mechanically rejects any
+  store import or raw-writer call in `reasoner.py`, `llm_reasoner.py`
+  and `llm_transport.py`).
 * **Synthesis only consumes `supported` claims** whose supporting evidence
   validates right now; citations are derived from `claim_evidence` —
   callers can never inject citation text.
-* A future LLM adapter may replace `DeterministicReasoner` behind the
-  `ReasonerPort`; it must remain proposal-only.
+* **The LLM adapter (`LLMReasoner`, Commit 12) is a proposal source only.**
+  It sits behind the `ReasonerPort`, never writes to the database, never
+  imports the store, and every proposal it emits must pass the
+  deterministic verifier before any domain-layer apply. LLM output is
+  advisory/proposal data; the deterministic verifier and domain layer
+  remain authoritative.
 
 ## Claim lifecycle
 
@@ -159,6 +169,98 @@ lease and stops the loop at the next iteration boundary.
 | migration SQL + `user_version` bump | yes |
 | phase side effects | intentionally idempotent/retryable (not a single txn) |
 
+## LLM reasoner adapter (Commit 12)
+
+`LLMReasoner` is a proposal-only implementation of `ReasonerPort`. It is
+NOT wired into `ResearchLoop` by default (the loop keeps its deterministic
+`DeterministicReasoner`); it is an opt-in capability with its own test
+suite, ready for a future integration commit.
+
+```
+ResearchLoop -> ReasonerPort -> LLMReasoner -> proposal objects
+    -> deterministic verifier (research/verifier.py) -> domain-layer apply
+    -> persisted state
+```
+
+**Boundary.** The adapter is pure from the domain's perspective: it never
+imports `research.store` / `evidence.store` / `docpipe.db`, never calls
+raw status writers, never creates claims/links/contradictions, never
+touches the filesystem, and never mutates claim status. These constraints
+are enforced mechanically by `tests/research/test_arch_boundary.py` (AST
+scan) and `tests/research/test_llm_reasoner.py` (fresh-interpreter import
+check). The C2 methods (`plan_queries`, `construct_claims`, `adjudicate`,
+`synthesize`) delegate to the embedded `DeterministicReasoner`, so the
+adapter is a drop-in `ReasonerPort`.
+
+**Proposal-only principle.** The LLM never becomes an authoritative state
+writer. Its output is structured JSON parsed into typed proposal objects
+(`ClaimDecompositionProposal`, `EvidenceRelationProposal`,
+`SemanticContradictionProposal`, `ClaimContextProposal`,
+`CoverageProposal`); the deterministic verifier then re-checks every
+proposal against persisted objects and domain invariants before any
+domain-layer apply. **LLM output is advisory/proposal data. The
+deterministic verifier and domain layer remain authoritative.** A
+malicious or hallucinating model cannot corrupt claim status, evidence
+links, citations, contradictions, context or coverage.
+
+**Structured output contract.** The model returns a single JSON object
+`{"proposals": [{"type": ..., ...fields}, ...]}`. Parsing is fail-closed:
+malformed JSON, an unknown `type`, a type not valid for the requested
+method, missing required fields, and wrong field types reject the WHOLE
+batch (`LLMResponseError`). `{"proposals": []}` is a valid empty result.
+Fabricated IDs, invalid roles/labels and out-of-range values PASS the
+parser by design — the deterministic verifier rejects them
+(`ProposalRejectedError`). The parser is purely syntactic; semantic
+validation stays in the verifier.
+
+**Deterministic input serialization.** For each method the adapter builds
+a byte-stable user message (`sort_keys`, compact separators, UTF-8; claim
+and evidence objects serialized by stable IDs; collections sorted by ID
+— never dict/set iteration order). Identical question/claims/evidence/
+context always produce identical model input. The system prompt is
+versioned (`REASONER_SYSTEM_PROMPT_V1`) and pins the proposal-only rules:
+never invent IDs, ground every assertion in supplied evidence, distinguish
+observation from inference, contradictions are observations not facts,
+context uses allowed keys only, coverage is an assessment, JSON only, and
+"no evidence found" ≠ "scientific research gap".
+
+**Failure semantics (fail-closed).** Model timeout -> `LLMTimeoutError`
+(wrapped as `LLMReasonerError`), transport failure ->
+`LLMTransportError`, malformed/empty response -> `LLMResponseError`,
+partial batch with any bad item -> whole batch rejected. A model failure
+never converts into "no evidence" or "research gap" and never corrupts an
+existing session (the adapter is pure — there is nothing to corrupt).
+`LLMReasonerStats` exposes per-call counters (`calls`, `proposals_parsed`,
+`last_error_category`) in memory only; raw model output is never
+persisted. Verifier rejections surface as `ProposalRejectedError` with a
+deterministic reason — never silently discarded.
+
+**Configuration.** Defaults live in `research/config.py`
+(`LLM_DEFAULT_PROVIDER = "opencode-go"`, `LLM_DEFAULT_MODEL = ""`,
+`LLM_DEFAULT_TIMEOUT_SECONDS = 60.0`). Empty model means "not configured":
+`LLMReasoner()` fails closed with `LLMNotConfiguredError` rather than
+guessing. Credentials come ONLY from environment variables with the
+repository's canonical names: `OPENCODE_GO_API_KEY` /
+`OPENCODE_GO_BASE_URL` (endpoint `https://opencode.ai/zen/go/v1`) and
+`OPENCODE_ZEN_API_KEY` / `OPENCODE_ZEN_BASE_URL` (endpoint
+`https://opencode.ai/zen/v1`). No secrets are ever hard-coded or
+committed.
+
+**Enabling a real provider.** The default transport
+(`research/llm_transport.py`) is OpenAI-compatible chat-completions via
+the `openai` SDK (a hard project dependency). To use it:
+`export OPENCODE_GO_API_KEY=...` (or the Zen variant), then construct
+`LLMReasoner(model="<model-slug>")`. Tests never need a live API: they
+inject a scripted fake transport, and the opt-in real-provider smoke test
+is marked `integration` (excluded by default).
+
+**Deterministic vs model-dependent.** Deterministic (authoritative):
+claim status, evidence validation, citations, coverage derivation,
+contradiction persistence, synthesis, all C2 loop behavior. Model-dependent
+(advisory): child statement wording, relationship/contradiction/context/
+coverage *proposals*, rationales. Everything model-dependent is
+proposal-shaped, verifier-checked and domain-applied.
+
 ## Current limitations (deliberate)
 
 * **FTS5 keyword retrieval only**: no stemming, no diacritic folding, no
@@ -182,13 +284,15 @@ lease and stops the loop at the next iteration boundary.
 * **C3 — verification**: claims ↔ evidence ↔ citations; semantic
   contradiction adjudication (through the ReasonerPort).
 
-**C3 status (Commit 11):** the proposal infrastructure and deterministic
-verifier exist (`research/reasoner.py` C3 proposal types,
-`research/verifier.py`). A future reasoner adapter may propose claim
-decompositions, evidence relationships, semantic contradiction
-observations, scope/context, and coverage — every proposal is verified
-against persisted objects before anything is persisted. The baseline
-`DeterministicReasoner` performs no semantic work.
+**C3 status (Commit 12):** the proposal infrastructure, deterministic
+verifier (`research/verifier.py`), and the LLM reasoner adapter
+(`research/llm_reasoner.py` + `research/llm_transport.py`) all exist.
+The adapter proposes claim decompositions, evidence relationships,
+semantic contradiction observations, scope/context, and coverage —
+every proposal is verified against persisted objects before anything is
+persisted, and the LLM never writes state. The baseline
+`DeterministicReasoner` remains the loop default; wiring `LLMReasoner`
+into `ResearchLoop` is a future integration commit.
 
 * **C4** — external sources: web/Scholar; requires `claim_evidence`
   context + C1 `source_type` extension.

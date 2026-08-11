@@ -75,3 +75,56 @@ def test_raw_writers_are_not_called_by_synthesis():
     synthesis = (REPO_ROOT / "research" / "synthesis.py").read_text(encoding="utf-8")
     for writer in ("update_claim_status", "update_session_status", "set_query_status"):
         assert writer not in synthesis
+
+
+def _llm_adapter_modules() -> list[Path]:
+    research_dir = REPO_ROOT / "research"
+    return [
+        research_dir / "llm_reasoner.py",
+        research_dir / "llm_transport.py",
+    ]
+
+
+def test_llm_adapter_has_no_store_or_domain_import():
+    """The LLM adapter must remain a pure proposal source (Commit 12): no
+    store module, no sqlite3, no domain apply layers."""
+    for module in _llm_adapter_modules():
+        assert module.is_file(), f"missing {module}"
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                assert "store" not in node.module.split("."), (
+                    f"{module.name} imports {node.module}"
+                )
+                assert node.module not in (
+                    "research.claims", "research.verifier",
+                    "research.synthesis", "research.loop",
+                ), f"{module.name} imports {node.module}"
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert "store" not in alias.name.split("."), (
+                        f"{module.name} imports {alias.name}"
+                    )
+        assert "import sqlite3" not in module.read_text(encoding="utf-8")
+
+
+def test_llm_adapter_never_calls_raw_writers_or_apply_functions():
+    """The adapter proposes; the deterministic verifier and domain layers
+    apply. Mechanical enforcement for the proposal-only principle."""
+    for module in _llm_adapter_modules():
+        calls = _calls_in_module(module)
+        for writer in _RAW_WRITERS:
+            assert writer not in calls, (
+                f"{module.name} calls raw writer {writer!r}"
+            )
+        for forbidden in (
+            "create_claim", "create_claim_from_proposal", "link_evidence",
+            "transition_claim", "apply_decomposition",
+            "apply_evidence_relation", "apply_semantic_contradiction",
+            "apply_context", "apply_coverage", "create_contradiction",
+            "close_contradiction",
+        ):
+            assert forbidden not in calls, (
+                f"{module.name} calls {forbidden!r} — apply belongs to "
+                "the verifier/domain layer"
+            )

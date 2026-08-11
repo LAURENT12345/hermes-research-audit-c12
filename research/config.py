@@ -33,3 +33,22 @@ MAX_STATEMENT_CHARS = 400
 #: expires after this and the next caller may take over. Long enough that
 #: a single iterate/start call completes well within it.
 SESSION_LOCK_TTL_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# LLM reasoner adapter (Commit 12) — transport defaults.
+#
+# Credentials are NEVER configured here; they come from environment
+# variables using the repository's canonical names (OPENCODE_GO_API_KEY /
+# OPENCODE_GO_BASE_URL, OPENCODE_ZEN_API_KEY / OPENCODE_ZEN_BASE_URL).
+# ---------------------------------------------------------------------------
+
+#: Default provider for the LLM reasoner transport (OpenCode Go is the
+#: repository's flat-namespace OpenAI-compatible endpoint).
+LLM_DEFAULT_PROVIDER = "opencode-go"
+
+#: Default model identifier. Empty means "not configured": LLMReasoner
+#: fails closed at construction rather than guessing a model.
+LLM_DEFAULT_MODEL = ""
+
+#: Per-call model timeout (seconds).
+LLM_DEFAULT_TIMEOUT_SECONDS = 60.0

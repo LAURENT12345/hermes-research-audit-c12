@@ -226,3 +226,118 @@ A tests/research/test_research_verifier2.py   16 tests
 M tests/research/test_research_model.py       Claim.to_dict keys
 M tests/research/test_research_hardening.py   v1 upgrade test (realistic v1 DB)
 ```
+
+---
+
+# Commit 12 (C3) — LLM Reasoner Adapter
+
+## What was added
+
+1. **`LLMReasoner`** (`research/llm_reasoner.py`) — a proposal-only
+   implementation of `ReasonerPort`. The C2 methods (`plan_queries`,
+   `construct_claims`, `adjudicate`, `synthesize`) delegate to the embedded
+   `DeterministicReasoner`, so the adapter is a drop-in `ReasonerPort`. The
+   five C3 methods (`propose_decomposition`, `propose_evidence_relations`,
+   `propose_semantic_contradictions`, `propose_context`,
+   `propose_coverage`) build deterministic input, call the transport,
+   parse the structured response into typed proposal objects, and return
+   them — **never applying anything**.
+
+2. **`LLMTransport` boundary** (`research/llm_transport.py`) — the
+   smallest transport interface (`complete(messages, *, timeout) -> str`)
+   with an OpenAI-compatible `ChatCompletionsTransport` (OpenCode Zen / Go
+   via the `openai` SDK, lazily imported) and a fail-closed factory.
+   Credentials come only from the repository's canonical env vars
+   (`OPENCODE_GO_API_KEY` / `OPENCODE_GO_BASE_URL`,
+   `OPENCODE_ZEN_API_KEY` / `OPENCODE_ZEN_BASE_URL`); endpoints mirror
+   `hermes_cli/auth.py` ProviderConfig. No secrets are committed.
+
+3. **Versioned prompt contract** — `REASONER_SYSTEM_PROMPT_V1` pins the
+   proposal-only rules (never invent IDs; ground assertions in supplied
+   evidence; observation ≠ inference; contradiction is a proposal; context
+   keys whitelisted; coverage is an assessment; JSON only; no
+   research-gap conflation), plus per-method task templates.
+
+4. **Deterministic input serialization** — `serialize_claim` /
+   `serialize_evidence` / `build_model_input` produce byte-stable JSON
+   (sort_keys, compact separators, UTF-8; collections sorted by stable
+   ID). Identical inputs always yield identical model requests.
+
+5. **Fail-closed structured parsing** — malformed JSON, unknown type,
+   type/method mismatch, missing required fields, wrong field types, or a
+   single bad item in a batch => `LLMResponseError` for the WHOLE batch.
+   Fabricated IDs / invalid enums / out-of-range values pass the parser
+   (syntactic only) and are rejected by the deterministic verifier.
+
+6. **Failure semantics** — timeout / transport failure / malformed /
+   empty responses raise `LLMReasonerError` subclasses; a model failure
+   never becomes "no evidence" or "research gap" and cannot corrupt a
+   session (the adapter is pure). `LLMReasonerStats` (in-memory only)
+   exposes `calls`, `proposals_parsed`, `last_error_category`; raw model
+   output is never persisted. Construction fails closed without a model.
+
+7. **Configuration** — `research/config.py` gains `LLM_DEFAULT_PROVIDER`
+   (`opencode-go`), `LLM_DEFAULT_MODEL` (`""` = not configured), and
+   `LLM_DEFAULT_TIMEOUT_SECONDS`. Provider/model/timeout are constructor
+   args; secrets are env-only.
+
+8. **Mechanical boundary enforcement** — `test_arch_boundary.py` now AST-
+   scans `llm_reasoner.py` + `llm_transport.py` for store/domain imports,
+   raw writers and apply functions; `test_llm_reasoner.py` adds a
+   fresh-interpreter check that importing the adapter pulls in no store
+   module.
+
+## Boundary (what the adapter cannot do)
+
+- no `research.store` / `evidence.store` / `docpipe.db` import,
+- no sqlite3 import, no filesystem writes, no claim-status mutation,
+- no citation creation, no evidence-ID invention (model may only
+  reference IDs present in the supplied input),
+- no direct `apply_*` / raw-writer calls — the verifier + domain layer
+  remain the ONLY writers.
+
+**LLM output is advisory/proposal data. The deterministic verifier and
+domain layer remain authoritative.**
+
+## Tests
+
+`tests/research/test_llm_reasoner.py` (43 tests): port boundary, parsing
+(all five types + malformed/unknown/missing/wrong-type/wrong-method),
+ID safety (fabricated ids reach the verifier and are rejected; wrong
+claim↔evidence relationships rejected), deterministic serialization
+(identical input -> identical request; insertion-order independence),
+failure behavior (timeout/transport/malformed/empty), verifier
+integration (valid apply, invalid cannot mutate, contradiction never
+changes claim status), config resolution, stats observability.
+
+`tests/research/test_llm_e2e.py` (3 tests, Phase 10 black-box): full
+pipeline `PDF -> ingest -> deterministic loop -> LLM adapter (fake
+transport) -> proposals -> verifier -> domain apply -> synthesis` with
+real persisted IDs; a malicious-model test (fabricated ids fully
+neutralized, zero state change); and a short-circuit test (no evidence
+=> no model call). No live API is required.
+
+`tests/research/test_arch_boundary.py`: +2 mechanical boundary tests.
+
+Full regression: run `python -m pytest tests/research/ -q` (expect 44x
+tests, all green). Ruff: clean.
+
+## Files changed (Commit 12)
+
+```
+A research/llm_reasoner.py    LLMReasoner adapter (serialization, prompt, parser)
+A research/llm_transport.py   LLMTransport boundary + OpenAI-compatible transport
+M research/config.py          LLM defaults (provider/model/timeout)
+A tests/research/test_llm_reasoner.py   43 tests (sections A–G)
+A tests/research/test_llm_e2e.py        3 black-box tests (Phase 10)
+M tests/research/test_arch_boundary.py  +2 mechanical boundary tests
+M research/README.md          LLM adapter section + C3 status
+M research/IMPLEMENTATION_REPORT.md     (this section)
+```
+
+## Deferred (Commit 13 candidates)
+
+- Wiring `LLMReasoner` into `ResearchLoop`/API as an opt-in reasoner
+  (proposal submission endpoints, per-call verification pipeline).
+- Real-provider integration smoke test (opt-in, `integration`-marked).
+- C4 external sources (web/Scholar) per the original roadmap.
