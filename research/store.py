@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # build understands is rejected deterministically.
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(Exception):
@@ -237,12 +237,30 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _apply_migrations(conn)
 
 
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    """C3 hardening: contradiction observations get a deterministic
+    identity key. The UNIQUE index makes identical concurrent
+    observations converge to one persisted row while distinct
+    observations (different evidence/context/rationale) both survive.
+    NULL keys (explicit/structural records) are unaffected."""
+    add_column_if_missing(
+        conn, "claim_contradictions", "observation_key",
+        "observation_key TEXT",
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "idx_claim_contradictions_observation ON "
+        "claim_contradictions(claim_id, kind, observation_key)"
+    )
+
+
 #: Ordered migrations {version: SQL or callable}; migration 1 is the
 #: current schema. Callables receive the connection and run inside the
 #: migration's write_txn (used for idempotent ALTERs).
 _MIGRATIONS: dict[int, object] = {
     1: RESEARCH_SCHEMA_SQL,
     2: _migrate_to_v2,
+    3: _migrate_to_v3,
 }
 
 
@@ -810,12 +828,18 @@ def create_contradiction(
     claim_id: str,
     kind: str,
     detail: Optional[str] = None,
+    observation_key: Optional[str] = None,
 ) -> Contradiction:
-    """Insert an open contradiction record; returns it."""
+    """Insert an open contradiction record; returns it.
+
+    ``observation_key`` (C3) is the deterministic identity of a semantic
+    observation; the UNIQUE index (claim_id, kind, observation_key)
+    converges identical concurrent observations to one row.
+    """
     conn.execute(
-        "INSERT INTO claim_contradictions (session_id, claim_id, kind, status, detail) "
-        "VALUES (?, ?, ?, 'open', ?)",
-        (session_id, claim_id, kind, detail),
+        "INSERT INTO claim_contradictions (session_id, claim_id, kind, status, "
+        "detail, observation_key) VALUES (?, ?, ?, 'open', ?, ?)",
+        (session_id, claim_id, kind, detail, observation_key),
     )
     row = conn.execute(
         "SELECT * FROM claim_contradictions WHERE id = last_insert_rowid()"
@@ -859,6 +883,22 @@ def find_open_contradiction(
         "SELECT * FROM claim_contradictions WHERE claim_id = ? AND kind = ? "
         "AND status = 'open' ORDER BY id LIMIT 1",
         (claim_id, kind),
+    ).fetchone()
+    return Contradiction.from_row(row) if row is not None else None
+
+
+def get_contradiction_by_key(
+    conn: sqlite3.Connection,
+    *,
+    claim_id: str,
+    kind: str,
+    observation_key: str,
+) -> Optional[Contradiction]:
+    """The open record with the exact observation identity (C3), if any."""
+    row = conn.execute(
+        "SELECT * FROM claim_contradictions WHERE claim_id = ? AND kind = ? "
+        "AND observation_key = ? AND status = 'open' ORDER BY id LIMIT 1",
+        (claim_id, kind, observation_key),
     ).fetchone()
     return Contradiction.from_row(row) if row is not None else None
 

@@ -278,12 +278,13 @@ class Contradiction:
     id: int
     session_id: str
     claim_id: str
-    kind: str  # 'explicit' | 'structural'
+    kind: str  # 'explicit' | 'structural' | 'semantic'
     status: str  # 'open' | 'resolved' | 'dismissed'
     detail: Optional[str]
     resolution: Optional[str]
     created_at: Optional[str]
     resolved_at: Optional[str]
+    observation_key: Optional[str] = None  # C3 semantic observation identity
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -294,6 +295,7 @@ class Contradiction:
             "status": self.status,
             "detail": self.detail,
             "resolution": self.resolution,
+            "observation_key": self.observation_key,
             "created_at": self.created_at,
             "resolved_at": self.resolved_at,
         }
@@ -310,6 +312,7 @@ class Contradiction:
             resolution=row["resolution"],
             created_at=row["created_at"],
             resolved_at=row["resolved_at"],
+            observation_key=row["observation_key"],
         )
 
 

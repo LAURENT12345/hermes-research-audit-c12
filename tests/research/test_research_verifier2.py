@@ -367,7 +367,7 @@ def test_fresh_db_has_v2_columns(env):
     db_path, _ = env
     conn = store.connect(db_path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(claims)")}
         assert "parent_claim_id" in cols and "context" in cols
     finally:
@@ -388,13 +388,13 @@ def test_upgrade_v1_to_v2_preserves_data(tmp_path):
 
     conn = store.connect(db_path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
         assert store.get_session(conn, "S-000001") is not None
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(claims)")}
         assert "parent_claim_id" in cols and "context" in cols
         # The migration is idempotent on reconnect.
         conn.close()
         conn = store.connect(db_path)
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == store.SCHEMA_VERSION
     finally:
         conn.close()

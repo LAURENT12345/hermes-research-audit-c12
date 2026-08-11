@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from typing import Optional
+
+from hermes_cli.sqlite_util import write_txn
 
 from research import claims, store
 import evidence.store as c1store
@@ -278,30 +281,23 @@ def _require_verdict(conn, validator, proposal) -> None:
 
 
 def apply_decomposition(conn, proposal: ClaimDecompositionProposal):
-    """Create child claims for a validated decomposition.
+    """Create child claims for a validated decomposition — ATOMICALLY.
 
-    Children are created through ``claims.create_claim`` (deduplicated),
-    marked with ``parent_claim_id``, and linked to the (validated,
-    source-linked) evidence. Whether a child is ever supported is decided
-    by the deterministic evaluator — an unsupported child is
-    ``insufficient`` and can never enter synthesis.
+    Delegates to ``claims.create_decomposed_claims``, which performs the
+    whole decomposition (children + parent assignment + evidence links +
+    audit events) inside ONE write_txn. A failure rolls back everything;
+    re-applying the same decomposition reuses existing children.
     """
     _require_verdict(conn, validate_decomposition, proposal)
     source = store.get_claim(conn, proposal.source_claim_id)
-    created = []
-    for statement in proposal.child_statements:
-        child = claims.create_claim(
-            conn, session_id=source.session_id, statement=statement,
-            notes=f"decomposition of {proposal.source_claim_id}",
-        )
-        store.set_claim_parent(conn, child.claim_id, proposal.source_claim_id)
-        for evidence_id in proposal.child_evidence_ids:
-            claims.link_evidence(
-                conn, claim_id=child.claim_id, evidence_id=evidence_id,
-                role="supporting",
-            )
-        created.append(child)
-    return created
+    return claims.create_decomposed_claims(
+        conn,
+        session_id=source.session_id,
+        parent_claim_id=proposal.source_claim_id,
+        statements=list(proposal.child_statements),
+        evidence_ids=list(proposal.child_evidence_ids),
+        notes=f"decomposition of {proposal.source_claim_id}",
+    )
 
 
 def apply_evidence_relation(conn, proposal: EvidenceRelationProposal):
@@ -314,20 +310,50 @@ def apply_evidence_relation(conn, proposal: EvidenceRelationProposal):
     )
 
 
+def _contradiction_observation_key(proposal: SemanticContradictionProposal) -> str:
+    """Deterministic identity of a semantic contradiction observation.
+
+    Encodes the full relationship: claim pair (direction preserved),
+    both evidence sides, context, rationale, strength. Two identical
+    submissions produce the same key (idempotent); observations that
+    differ in ANY of these are distinct records.
+    """
+    import hashlib
+
+    canonical = {
+        "claim_a": proposal.claim_a_id,
+        "claim_b": proposal.claim_b_id,
+        "evidence_a": sorted(proposal.evidence_a_ids),
+        "evidence_b": sorted(proposal.evidence_b_ids),
+        "context": proposal.context,
+        "rationale": proposal.rationale,
+        "strength": proposal.strength,
+    }
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def apply_semantic_contradiction(
     conn, proposal: SemanticContradictionProposal
 ):
     """Persist a validated semantic contradiction OBSERVATION.
 
-    Recorded as a ``claim_contradictions`` row with ``kind='semantic'``.
-    Neither claim's authoritative status is changed; both findings are
-    preserved. Idempotent: an existing open semantic observation for the
-    same claim is returned as-is.
+    Recorded as a ``claim_contradictions`` row with ``kind='semantic'``
+    and a deterministic ``observation_key``. Neither claim's
+    authoritative status is changed; both findings are preserved.
+
+    Idempotency + concurrency: the UNIQUE index (claim_id, kind,
+    observation_key) converges identical observations to one row — a
+    concurrent duplicate INSERT raises IntegrityError, which is caught
+    and resolved by returning the winning row. Distinct observations
+    (different evidence/context/rationale/strength) each persist.
     """
     _require_verdict(conn, validate_semantic_contradiction, proposal)
     claim_a = store.get_claim(conn, proposal.claim_a_id)
-    existing = store.find_open_contradiction(
-        conn, proposal.claim_a_id, "semantic"
+    key = _contradiction_observation_key(proposal)
+    existing = store.get_contradiction_by_key(
+        conn, claim_id=proposal.claim_a_id, kind="semantic",
+        observation_key=key,
     )
     if existing is not None:
         return existing
@@ -342,28 +368,46 @@ def apply_semantic_contradiction(
         },
         ensure_ascii=False,
     )
-    record = store.create_contradiction(
-        conn, session_id=claim_a.session_id, claim_id=proposal.claim_a_id,
-        kind="semantic", detail=detail,
-    )
-    store.add_event(
-        conn,
-        session_id=claim_a.session_id,
-        event_type="contradiction_detected",
-        detail=json.dumps(
-            {"contradiction_id": record.id, "claim_id": proposal.claim_a_id,
-             "kind": "semantic", "other_claim_id": proposal.claim_b_id},
-            ensure_ascii=False,
-        ),
-    )
+    try:
+        with write_txn(conn):
+            record = store.create_contradiction(
+                conn, session_id=claim_a.session_id,
+                claim_id=proposal.claim_a_id, kind="semantic",
+                detail=detail, observation_key=key,
+            )
+            store.add_event(
+                conn,
+                session_id=claim_a.session_id,
+                event_type="contradiction_detected",
+                detail=json.dumps(
+                    {"contradiction_id": record.id,
+                     "claim_id": proposal.claim_a_id, "kind": "semantic",
+                     "other_claim_id": proposal.claim_b_id},
+                    ensure_ascii=False,
+                ),
+            )
+    except sqlite3.IntegrityError:
+        # A concurrent identical observation won the race: converge.
+        record = store.get_contradiction_by_key(
+            conn, claim_id=proposal.claim_a_id, kind="semantic",
+            observation_key=key,
+        )
+        if record is None:
+            raise
+        return record
     return record
 
 
 def apply_context(conn, proposal: ClaimContextProposal):
-    """Persist a validated claim scope/context (JSON text)."""
+    """Persist a validated claim scope/context (JSON text), MERGING with
+    any existing context: proposal keys win, unrelated existing keys are
+    preserved. Repeated identical application is idempotent."""
     _require_verdict(conn, validate_context, proposal)
+    claim = store.get_claim(conn, proposal.claim_id)
+    existing = json.loads(claim.context) if claim.context else {}
+    merged = {**existing, **proposal.context}
     store.set_claim_context(
-        conn, proposal.claim_id, json.dumps(proposal.context, ensure_ascii=False)
+        conn, proposal.claim_id, json.dumps(merged, ensure_ascii=False)
     )
     return store.get_claim(conn, proposal.claim_id)
 

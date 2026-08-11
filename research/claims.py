@@ -44,7 +44,12 @@ from typing import Optional
 from hermes_cli.sqlite_util import write_txn
 
 from research import store
-from research.model import Claim, ClaimEvidenceLink
+from research.model import (
+    Claim,
+    ClaimEvidenceLink,
+    format_claim_id,
+    normalize_statement,
+)
 from research.reasoner import ClaimProposal
 from research import config
 from evidence import store as c1store
@@ -96,6 +101,10 @@ class ClaimTransitionError(ClaimError):
 
 class InvalidClaimError(ClaimError):
     """Statement is empty or exceeds MAX_STATEMENT_CHARS."""
+
+
+class ClaimHierarchyError(ClaimError):
+    """An invalid claim parent/child relationship was requested."""
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +228,145 @@ def _require_claim(conn, claim_id: str) -> Claim:
     if claim is None:
         raise ClaimNotFoundError(f"claim {claim_id} not found")
     return claim
+
+
+# ---------------------------------------------------------------------------
+# Claim hierarchy (decomposition parent/child) — C3 hardening
+# ---------------------------------------------------------------------------
+
+def validate_parent_relation(
+    conn, child_id: str, parent_id: str, *, child: Optional[Claim] = None
+) -> None:
+    """Deterministic parent/child integrity rules (raises ClaimHierarchyError).
+
+    * parent must exist,
+    * a claim cannot be its own parent,
+    * parent and child must belong to the same session,
+    * the parent chain must not contain a cycle.
+    """
+    if child_id == parent_id:
+        raise ClaimHierarchyError("a claim cannot be its own parent")
+    child = child or _require_claim(conn, child_id)
+    parent = store.get_claim(conn, parent_id)
+    if parent is None:
+        raise ClaimHierarchyError(f"parent claim {parent_id} not found")
+    if parent.session_id != child.session_id:
+        raise ClaimHierarchyError(
+            f"parent {parent_id} and child {child_id} must belong to the "
+            "same session"
+        )
+    # Cycle detection: walk up the parent chain.
+    seen = {child_id}
+    current = parent_id
+    while current is not None:
+        if current in seen:
+            raise ClaimHierarchyError(
+                f"parent cycle detected involving claim {current}"
+            )
+        seen.add(current)
+        row = store.get_claim(conn, current)
+        current = row.parent_claim_id if row is not None else None
+
+
+def create_decomposed_claims(
+    conn,
+    *,
+    session_id: str,
+    parent_claim_id: str,
+    statements: list[str],
+    evidence_ids: list[str],
+    notes: Optional[str] = None,
+) -> list[Claim]:
+    """Atomically create (or reuse) child claims of a decomposition.
+
+    Everything happens inside ONE write_txn: parent hierarchy validated,
+    children deduplicated by normalized statement, parent assigned,
+    evidence linked, audit events written. A failure at any point rolls
+    back the whole decomposition — no partial children, no partial
+    links, no partial audit state.
+
+    Idempotent re-application: children whose normalized statement
+    already exists are reused (with their existing parent — re-parenting
+    to a DIFFERENT parent is rejected deterministically).
+    """
+    parent = store.get_claim(conn, parent_claim_id)
+    if parent is None:
+        raise ClaimHierarchyError(f"parent claim {parent_claim_id} not found")
+    if parent.session_id != session_id:
+        raise ClaimHierarchyError(
+            "parent and children must belong to the same session"
+        )
+
+    created: list[Claim] = []
+    with write_txn(conn):
+        for statement in statements:
+            normalized = normalize_statement(statement)
+            existing = conn.execute(
+                "SELECT * FROM claims WHERE session_id = ? "
+                "AND statement_normalized = ?",
+                (session_id, normalized),
+            ).fetchone()
+            if existing is not None:
+                child = Claim.from_row(existing)
+                # Re-parenting rule: an existing child may not be moved to
+                # a different parent.
+                if (
+                    child.parent_claim_id is not None
+                    and child.parent_claim_id != parent_claim_id
+                ):
+                    raise ClaimHierarchyError(
+                        f"claim {child.claim_id} already belongs to parent "
+                        f"{child.parent_claim_id}; re-parenting is not allowed"
+                    )
+            else:
+                child_id = store._next_id(  # noqa: SLF001 - shared package helper
+                    conn, "claims", "C-", format_claim_id
+                )
+                conn.execute(
+                    "INSERT INTO claims (id, session_id, statement, "
+                    "statement_normalized, status, notes) "
+                    "VALUES (?, ?, ?, ?, 'proposed', ?)",
+                    (child_id, session_id, statement, normalized, notes),
+                )
+                conn.execute(
+                    "INSERT INTO research_events (session_id, event_type, detail) "
+                    "VALUES (?, 'claim_proposed', ?)",
+                    (session_id, json.dumps({"claim_id": child_id})),
+                )
+                child = Claim.from_row(
+                    conn.execute(
+                        "SELECT * FROM claims WHERE id = ?", (child_id,)
+                    ).fetchone()
+                )
+
+            # Hierarchy rules apply inside the transaction too.
+            validate_parent_relation(
+                conn, child.claim_id, parent_claim_id, child=child
+            )
+            conn.execute(
+                "UPDATE claims SET parent_claim_id = ? WHERE id = ?",
+                (parent_claim_id, child.claim_id),
+            )
+            for evidence_id in evidence_ids:
+                existing_link = conn.execute(
+                    "SELECT 1 FROM claim_evidence WHERE claim_id = ? "
+                    "AND evidence_id = ? AND role = 'supporting'",
+                    (child.claim_id, evidence_id),
+                ).fetchone()
+                if existing_link is None:
+                    conn.execute(
+                        "INSERT INTO claim_evidence (claim_id, evidence_id, role) "
+                        "VALUES (?, ?, 'supporting')",
+                        (child.claim_id, evidence_id),
+                    )
+            created.append(
+                Claim.from_row(
+                    conn.execute(
+                        "SELECT * FROM claims WHERE id = ?", (child.claim_id,)
+                    ).fetchone()
+                )
+            )
+    return created
 
 
 # ---------------------------------------------------------------------------
